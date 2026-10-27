@@ -1,21 +1,25 @@
 # granite
 
 A minimal terminal multiplexer written in Zig on Ghostty's `ghostty-vt`
-module. With no arguments it runs `claude` on the left and `codex` on the
-right. Each program runs in its own pty and terminal; granite redraws only
+module. With no arguments it runs `claude` on the left, `codex` on the top
+right, and `opencode` on the bottom right. Each program runs in its own pty and terminal; granite redraws only
 the rows that changed.
 
 ```sh
-./zig-out/bin/granite                         # claude | codex
+./zig-out/bin/granite                         # claude | codex over opencode
 ./zig-out/bin/granite htop                    # one pane, no header or divider
-./zig-out/bin/granite claude :: codex         # two explicit commands
+./zig-out/bin/granite claude :: codex         # two side-by-side commands
+./zig-out/bin/granite claude :: codex :: htop # left | top right over bottom right
 ./zig-out/bin/granite sh -l :: htop           # arguments belong to each command
 ```
 
-- In split mode, **Ctrl-]** switches focus between live panes. The header
-  highlights the focused program, and shows each program's exit status.
-  Each pane gets half the width, with a divider between them; the header
-  uses the first row.
+- In split mode, **Ctrl-]** moves focus to the next live pane: left, then
+  top right, then bottom right. Each pane has a header row with its program
+  and exit status, black on white for the focused pane and black on gray for
+  the others. The left pane gets half the
+  width, with a divider between it and the right side. With three commands,
+  the right side is split into a top and a bottom pane, each with its own
+  header row.
 - Keyboard input goes to the focused pane. SGR cell-coordinate mouse reports are translated
   into its coordinates; reports outside that pane and other mouse formats
   are dropped in split mode. A single command receives all input unchanged.
@@ -33,9 +37,9 @@ the rows that changed.
   agree on character widths.
 - Frames are wrapped in synchronized output and limited to about 60 per
   second. While a program holds rendering (mode 2026), its pane waits for
-  up to one second; the other pane continues drawing.
-- The focused pane controls the host title. Bells from either pane pass through.
-- Resizing the host window resizes both ptys and terminals.
+  up to one second; the other panes continue drawing.
+- The focused pane controls the host title. Bells from any pane pass through.
+- Resizing the host window resizes every pty and terminal.
 - An exited pane keeps its last screen, and focus moves to the surviving
   program. Granite exits when all programs have exited, returning the first
   nonzero status in pane order, or zero. A single command keeps its exit status.
@@ -95,7 +99,8 @@ covers mode 2026 holds and their timeout, frame coalescing, resizing,
 mirroring and restoring input modes, query replies, input forwarding, and
 exit status. Split-mode tests cover legacy and Kitty Ctrl-] focus switching,
 focused modes, cursor and title, focus events, independent holds, per-pane
-resizing, mouse coordinates, and programs exiting at different times.
+resizing, mouse coordinates, and programs exiting at different times. Three-pane
+tests cover the stacked layout, focus order, and skipping exited panes.
 
 ### Recording
 

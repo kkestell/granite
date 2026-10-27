@@ -87,11 +87,17 @@ const Host = struct {
     }
 
     fn startSplit(left: []const []const u8, right: []const []const u8, cols: u16, rows: u16) !*Host {
+        return startPanes(&.{ left, right }, cols, rows);
+    }
+
+    /// Start granite running the child once per entry of `panes`.
+    fn startPanes(panes: []const []const []const u8, cols: u16, rows: u16) !*Host {
         var args: std.ArrayList([]const u8) = .empty;
         defer args.deinit(gpa);
-        try args.appendSlice(gpa, left);
-        try args.appendSlice(gpa, &.{ "::", options.child });
-        try args.appendSlice(gpa, right);
+        for (panes, 0..) |pane, i| {
+            if (i > 0) try args.appendSlice(gpa, &.{ "::", options.child });
+            try args.appendSlice(gpa, pane);
+        }
         return start(args.items, cols, rows);
     }
 
@@ -587,4 +593,86 @@ test "split renders wide characters at each pane's offset" {
     try h.waitForScreen("(exited 0)");
     h.send("q");
     try std.testing.expectEqual(0, try h.wait());
+}
+
+test "three panes stack the right side and cycle focus" {
+    const h = try Host.startPanes(&.{ &.{"size"}, &.{"size"}, &.{"size"} }, 81, 12);
+    defer h.deinit();
+    try h.waitUntil(5000, {}, struct {
+        fn f(host: *Host, _: void) bool {
+            const text = host.screen() catch return false;
+            return std.mem.count(u8, text, "size 40x11") == 1 and std.mem.count(u8, text, "size 40x5") == 2;
+        }
+    }.f);
+    var rows = std.mem.splitScalar(u8, try h.screen(), '\n');
+    var lines: [12][]const u8 = undefined;
+    for (&lines) |*line| line.* = rows.next().?;
+    try std.testing.expectEqualStrings("size 40x11                              │size 40x5", lines[1]);
+    try std.testing.expect(std.mem.startsWith(u8, lines[6], "                                        │granite-test-child"));
+    try std.testing.expectEqualStrings("                                        │size 40x5", lines[7]);
+    try std.testing.expect(std.mem.count(u8, try h.screen(), "│") == 12);
+
+    try h.resize(100, 9);
+    try h.waitForScreen("size 49x8");
+    try h.waitForScreen("size 50x4");
+    try h.waitForScreen("size 50x3");
+    try std.testing.expect(std.mem.count(u8, try h.screen(), "│") == 9);
+    h.send("q");
+    try h.waitForScreen("(exited 0)");
+    h.send("q");
+    try h.waitUntil(5000, {}, struct {
+        fn f(host: *Host, _: void) bool {
+            const text = host.screen() catch return false;
+            return std.mem.count(u8, text, "(exited 0)") == 2;
+        }
+    }.f);
+    h.send("q");
+    try std.testing.expectEqual(0, try h.wait());
+}
+
+test "three panes route input in focus order and skip exited panes" {
+    var path_buf: [128]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, "/tmp/granite-live-{d}.mouse3", .{c.getpid()});
+    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+    const h = try Host.startPanes(&.{
+        &.{ "input", "left", "plain", "0" },
+        &.{ "input", "top", "plain", "5" },
+        &.{ "input", "bottom", "plain", "0", path },
+    }, 81, 12);
+    defer h.deinit();
+    try h.waitForScreen("left ready");
+    try h.waitForScreen("top ready");
+    try h.waitForScreen("bottom ready");
+    h.send("a\x1db\x1dc");
+    try h.waitForScreen("left got 97");
+    try h.waitForScreen("top got 98");
+    try h.waitForScreen("bottom got 99");
+
+    // The bottom pane starts on row 8 and column 42 of the host.
+    h.send("\x1b[<0;43;10M\x1b[<0;43;4M");
+    try h.waitForScreen("bottom got 77");
+
+    // From the bottom pane, Ctrl-] wraps to the left pane.
+    h.send("\x1dd\x1dq");
+    try h.waitForScreen("left got 100");
+    try h.waitForScreen("(exited 5)");
+    // Focus moved past the exited top pane to the bottom one.
+    h.send("e");
+    try h.waitForScreen("bottom got 101");
+    for ([_][]const u8{ "left got 98", "top got 97", "bottom got 98", "left got 101" }) |text| {
+        try std.testing.expect(std.mem.indexOf(u8, h.output.items, text) == null);
+    }
+    h.send("q");
+    try h.waitUntil(5000, {}, struct {
+        fn f(host: *Host, _: void) bool {
+            const text = host.screen() catch return false;
+            return std.mem.count(u8, text, "(exited") == 2;
+        }
+    }.f);
+    h.send("q");
+    try std.testing.expectEqual(5, try h.wait());
+
+    const recorded = try std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .unlimited);
+    defer gpa.free(recorded);
+    try std.testing.expectEqualStrings("c\x1b[<0;2;3Meq", recorded);
 }

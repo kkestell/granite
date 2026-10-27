@@ -1,14 +1,16 @@
-//! A minimal terminal multiplexer with one or two panes, no detach.
+//! A minimal terminal multiplexer with one to three panes, no detach.
 //!
-//! With no arguments, runs claude on the left and codex on the right.
-//! Ctrl-] switches focus. A command runs alone with unchanged input and
-//! no chrome; separate two commands with a lone :: to split them.
+//! With no arguments, runs claude on the left, codex on the top right, and
+//! opencode on the bottom right. Ctrl-] moves focus to the next pane. A
+//! command runs alone with unchanged input and no chrome; separate two or
+//! three commands with a lone :: to split them.
 //! Each program has its own pty and Ghostty terminal. The focused pane's
 //! input modes are mirrored onto the host, and only dirty rows redraw.
 //!
 //!   ./zig-out/bin/granite
 //!   ./zig-out/bin/granite htop
 //!   ./zig-out/bin/granite claude :: codex
+//!   ./zig-out/bin/granite claude :: codex :: opencode
 
 const std = @import("std");
 const mux = @import("mux.zig");
@@ -137,31 +139,36 @@ pub fn main(init: std.process.Init) !u8 {
     const args = init.minimal.args.vector;
     const claude = [_:null]?[*:0]const u8{"claude"};
     const codex = [_:null]?[*:0]const u8{"codex"};
-    var commands = [_][*:null]const ?[*:0]const u8{ &claude, &codex };
-    var count: usize = 2;
-    var left_args: ?[:null]?[*:0]const u8 = null;
-    defer if (left_args) |a| gpa.free(a);
+    const opencode = [_:null]?[*:0]const u8{"opencode"};
+    var commands = [_][*:null]const ?[*:0]const u8{ &claude, &codex, &opencode };
+    var count: usize = 3;
+    // Every command but the last needs its own null-terminated copy.
+    var copies: [2]?[:null]?[*:0]const u8 = @splat(null);
+    defer for (copies) |copy| if (copy) |a| gpa.free(a);
     if (args.len > 1) {
-        var separator: ?usize = null;
+        var separators: [2]usize = undefined;
+        var found: usize = 0;
+        var start: usize = 1;
         for (args[1..], 1..) |arg, i| {
-            if (std.mem.eql(u8, std.mem.span(arg), "::")) {
-                if (separator != null or i == 1 or i + 1 == args.len) {
-                    std.debug.print("granite: expected cmd args... :: cmd args...\n", .{});
-                    return 2;
-                }
-                separator = i;
+            if (!std.mem.eql(u8, std.mem.span(arg), "::")) continue;
+            if (found == separators.len or i == start or i + 1 == args.len) {
+                std.debug.print("granite: expected cmd args... [:: cmd args... [:: cmd args...]]\n", .{});
+                return 2;
             }
+            separators[found] = i;
+            found += 1;
+            start = i + 1;
         }
-        if (separator) |at| {
-            const left = try gpa.allocSentinel(?[*:0]const u8, at - 1, null);
-            left_args = left;
-            for (args[1..at], left) |arg, *dest| dest.* = arg;
-            commands[0] = left.ptr;
-            commands[1] = @ptrCast(args.ptr + at + 1);
-        } else {
-            count = 1;
-            commands[0] = @ptrCast(args.ptr + 1);
+        start = 1;
+        for (separators[0..found], copies[0..found], commands[0..found]) |at, *copy, *cmd| {
+            const head = try gpa.allocSentinel(?[*:0]const u8, at - start, null);
+            copy.* = head;
+            for (args[start..at], head) |arg, *dest| dest.* = arg;
+            cmd.* = head.ptr;
+            start = at + 1;
         }
+        commands[found] = @ptrCast(args.ptr + start);
+        count = found + 1;
     }
 
     if (c.isatty(posix.STDIN_FILENO) == 0 or c.isatty(posix.STDOUT_FILENO) == 0) {
@@ -169,7 +176,7 @@ pub fn main(init: std.process.Init) !u8 {
         return 1;
     }
 
-    var labels: [2][]const u8 = undefined;
+    var labels: [3][]const u8 = undefined;
     for (commands[0..count], labels[0..count]) |cmd, *label| label.* = std.fs.path.basename(std.mem.span(cmd[0].?));
     var m: Mux = undefined;
     try m.init(init.io, gpa, hostSize(), labels[0..count]);
@@ -189,7 +196,7 @@ pub fn main(init: std.process.Init) !u8 {
         const pid = forkpty(&pty, null, null, &p.ws);
         if (pid < 0) return error.ForkptyFailed;
         if (pid == 0) {
-            // The second child must not retain the first child's master.
+            // Later children must not retain earlier children's masters.
             for (m.panes[0..count]) |*other| if (other.pty) |fd| {
                 _ = c.close(fd);
             };
@@ -237,11 +244,11 @@ pub fn main(init: std.process.Init) !u8 {
                 timeout = if (timeout < 0) left else @min(timeout, left);
             }
         }
-        var fds = [_]posix.pollfd{
-            .{ .fd = posix.STDIN_FILENO, .events = posix.POLL.IN, .revents = 0 },
-            .{ .fd = m.panes[0].pty orelse -1, .events = posix.POLL.IN, .revents = 0 },
-            .{ .fd = if (count == 2) m.panes[1].pty orelse -1 else -1, .events = posix.POLL.IN, .revents = 0 },
-        };
+        var fds: [4]posix.pollfd = undefined;
+        fds[0] = .{ .fd = posix.STDIN_FILENO, .events = posix.POLL.IN, .revents = 0 };
+        for (m.panes[0..count], fds[1 .. count + 1]) |*p, *fd| {
+            fd.* = .{ .fd = p.pty orelse -1, .events = posix.POLL.IN, .revents = 0 };
+        }
         // Raw poll lets SIGWINCH interrupt the wait.
         if (c.poll(&fds, @intCast(count + 1), @intCast(timeout)) < 0) {
             if (posix.errno(-1) == .INTR) continue;
@@ -266,8 +273,8 @@ pub fn main(init: std.process.Init) !u8 {
             p.pty = null;
             p.held = false;
             live -= 1;
-            if (count == 2) m.chrome_dirty = true;
-            if (count == 2 and m.focus == i) m.setFocus(1 - i);
+            if (count > 1) m.chrome_dirty = true;
+            if (count > 1 and m.focus == i) m.focusNext();
         }
     }
     // Preserve a short-lived child's final output, including held output.

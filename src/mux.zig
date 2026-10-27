@@ -1,5 +1,6 @@
 //! Per-pane Ghostty terminals, host input routing, and rendering for one
-//! program or two side-by-side programs. Terminals can run without ptys
+//! program, two side-by-side programs, or a left program beside two
+//! stacked programs. Terminals can run without ptys
 //! for round-trip tests.
 
 const std = @import("std");
@@ -102,7 +103,7 @@ pub const Pane = struct {
 pub const Mux = struct {
     gpa: std.mem.Allocator,
     ws: posix.winsize,
-    panes: [2]Pane = undefined,
+    panes: [3]Pane = undefined,
     count: usize,
     focus: usize = 0,
     out: std.Io.Writer.Allocating,
@@ -111,8 +112,8 @@ pub const Mux = struct {
     host_kitty_flags: u8 = 0,
 
     pub fn init(m: *Mux, io: std.Io, gpa: std.mem.Allocator, ws: posix.winsize, labels: []const []const u8) !void {
-        std.debug.assert(labels.len == 1 or labels.len == 2);
-        m.* = .{ .gpa = gpa, .ws = ws, .count = labels.len, .out = .init(gpa), .chrome_dirty = labels.len == 2 };
+        std.debug.assert(labels.len >= 1 and labels.len <= 3);
+        m.* = .{ .gpa = gpa, .ws = ws, .count = labels.len, .out = .init(gpa), .chrome_dirty = labels.len > 1 };
         errdefer m.out.deinit();
         var initialized: usize = 0;
         errdefer for (m.panes[0..initialized]) |*p| p.deinit();
@@ -126,10 +127,18 @@ pub const Mux = struct {
     fn layout(m: *Mux, index: usize) struct { ws: posix.winsize, row: u16, col: u16 } {
         if (m.count == 1) return .{ .ws = m.ws, .row = 0, .col = 0 };
         // Ghostty and the pty require at least one cell in each dimension.
+        // Each pane has a header row above it.
         const width = @max(m.ws.col, 3);
-        const rows = @max(m.ws.row, 2) - 1;
         const left = (width - 1) / 2;
         const cols = if (index == 0) left else width - left - 1;
+        var row: u16 = 1;
+        var rows = @max(m.ws.row, 2) - 1;
+        if (m.count == 3 and index > 0) {
+            const height = @max(m.ws.row, 4);
+            const top = (height - 1) / 2;
+            rows = if (index == 1) top else height - top - 2;
+            if (index == 2) row = top + 2;
+        }
         return .{
             .ws = .{
                 .col = cols,
@@ -137,7 +146,7 @@ pub const Mux = struct {
                 .xpixel = @intCast(@as(u32, m.ws.xpixel) * cols / @max(m.ws.col, 1)),
                 .ypixel = @intCast(@as(u32, m.ws.ypixel) * rows / @max(m.ws.row, 1)),
             },
-            .row = 1,
+            .row = row,
             .col = if (index == 0) 0 else left + 1,
         };
     }
@@ -177,7 +186,7 @@ pub const Mux = struct {
             p.dirty = true;
         }
         try m.out.writer.writeAll("\x1b[2J");
-        m.chrome_dirty = m.count == 2;
+        m.chrome_dirty = m.count > 1;
     }
 
     pub fn needsRender(m: *Mux) bool {
@@ -196,6 +205,14 @@ pub const Mux = struct {
         if (next.terminal.modes.get(focus_mode)) next.send("\x1b[I");
         m.chrome_dirty = true;
         m.writeTitle();
+    }
+
+    /// Focus the next live pane after the focused one, in pane order.
+    pub fn focusNext(m: *Mux) void {
+        for (1..m.count) |step| {
+            const index = (m.focus + step) % m.count;
+            if (m.panes[index].status == null) return m.setFocus(index);
+        }
     }
 
     fn writeTitle(m: *Mux) void {
@@ -254,7 +271,7 @@ pub const Mux = struct {
             }
             if (swallow) {
                 m.panes[m.focus].send(data[start..i]);
-                if (toggle) m.setFocus(1 - m.focus);
+                if (toggle) m.focusNext();
                 start = end;
             }
             i = end;
@@ -453,7 +470,7 @@ pub fn render(m: *Mux) !void {
     // Grapheme clustering must be synchronized before drawing rows.
     try syncModes(m);
 
-    if (m.count == 2 and m.chrome_dirty) try renderChrome(m);
+    if (m.count > 1 and m.chrome_dirty) try renderChrome(m);
     m.chrome_dirty = false;
     for (m.panes[0..m.count]) |*p| {
         if (p.held) continue;
@@ -488,7 +505,9 @@ pub fn render(m: *Mux) !void {
 fn renderChrome(m: *Mux) !void {
     const w = &m.out.writer;
     for (m.panes[0..m.count], 0..) |*p, index| {
-        try w.print("\x1b[1;{d}H\x1b[0;{d}m", .{ p.col + 1, @as(u8, if (index == m.focus) 7 else 2) });
+        // Black on white for the focused pane, black on gray for the others.
+        const colors = if (index == m.focus) "38;2;0;0;0;48;2;255;255;255" else "38;2;0;0;0;48;2;128;128;128";
+        try w.print("\x1b[{d};{d}H\x1b[0;{s}m", .{ p.row, p.col + 1, colors });
         var label: std.Io.Writer.Allocating = .init(m.gpa);
         defer label.deinit();
         try label.writer.writeAll(p.label);
