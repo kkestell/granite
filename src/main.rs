@@ -19,19 +19,13 @@ use std::io::Write as _;
 use std::os::unix::ffi::OsStrExt as _;
 use std::path::Path;
 use std::process::ExitCode;
-use std::sync::atomic::{AtomicBool, Ordering};
 
+use granite::winch;
 use granite::mux::{self, HOLD_TIMEOUT_MS, Mux, Winsize, now_ms, read, write_all};
 use libghostty_vt::log::{Level, Logger};
 
 const FRAME_MS: i64 = 16;
 const HOST_REPLY_TIMEOUT_MS: i64 = 1000;
-
-static WINCH_PENDING: AtomicBool = AtomicBool::new(false);
-
-extern "C" fn on_sigwinch(_: libc::c_int) {
-    WINCH_PENDING.store(true, Ordering::Relaxed);
-}
 
 fn flush(m: &mut Mux) {
     write_all(libc::STDOUT_FILENO, &m.take_output());
@@ -256,20 +250,14 @@ fn spawn_and_run(m: &mut Mux, argvs: &[Vec<CString>]) -> Result<u8, Box<dyn Erro
 fn event_loop(m: &mut Mux) -> Result<u8, Box<dyn Error>> {
     query_host(m)?;
 
-    unsafe {
-        let mut action: libc::sigaction = std::mem::zeroed();
-        action.sa_sigaction = on_sigwinch as extern "C" fn(libc::c_int) as libc::sighandler_t;
-        libc::sigemptyset(&mut action.sa_mask);
-        action.sa_flags = 0;
-        libc::sigaction(libc::SIGWINCH, &action, std::ptr::null_mut());
-    }
+    let winch = winch::install()?;
 
     let count = m.panes.len();
     let mut last_render: i64 = 0;
     let mut buf = vec![0u8; 65536];
     let mut live = count;
     while live > 0 {
-        if WINCH_PENDING.swap(false, Ordering::Relaxed) {
+        if winch::take(winch) {
             resize(m)?;
         }
         let now = now_ms();
@@ -296,7 +284,7 @@ fn event_loop(m: &mut Mux) -> Result<u8, Box<dyn Error>> {
         for p in &m.panes {
             fds.push(libc::pollfd { fd: p.pty().unwrap_or(-1), events: libc::POLLIN, revents: 0 });
         }
-        // Raw poll lets SIGWINCH interrupt the wait.
+        fds.push(libc::pollfd { fd: winch, events: libc::POLLIN, revents: 0 });
         if unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, timeout as libc::c_int) } < 0 {
             if errno() == libc::EINTR {
                 continue;
@@ -310,7 +298,7 @@ fn event_loop(m: &mut Mux) -> Result<u8, Box<dyn Error>> {
             }
             m.input(&buf[..n as usize]);
         }
-        for (i, fd) in fds[1..].iter().enumerate() {
+        for (i, fd) in fds[1..=count].iter().enumerate() {
             if fd.revents & (libc::POLLIN | libc::POLLHUP) == 0 {
                 continue;
             }

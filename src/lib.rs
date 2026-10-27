@@ -4,3 +4,4 @@
 
 pub mod mux;
 pub mod recording;
+pub mod winch;

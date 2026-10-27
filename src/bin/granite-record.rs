@@ -8,16 +8,10 @@
 use std::ffi::CString;
 use std::os::unix::ffi::OsStrExt as _;
 use std::process::ExitCode;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 use granite::mux::{Winsize, read, write_all};
 use granite::recording::{self, Record, Size};
-
-static WINCH_PENDING: AtomicBool = AtomicBool::new(false);
-
-extern "C" fn on_sigwinch(_: libc::c_int) {
-    WINCH_PENDING.store(true, Ordering::Relaxed);
-}
+use granite::winch;
 
 fn host_size() -> Winsize {
     let mut ws = Winsize { ws_row: 0, ws_col: 0, ws_xpixel: 0, ws_ypixel: 0 };
@@ -87,17 +81,19 @@ fn record(file: libc::c_int, cmd: &[*const libc::c_char]) -> ExitCode {
     unsafe {
         libc::cfmakeraw(&mut raw);
         libc::tcsetattr(libc::STDIN_FILENO, libc::TCSAFLUSH, &raw);
-
-        let mut action: libc::sigaction = std::mem::zeroed();
-        action.sa_sigaction = on_sigwinch as extern "C" fn(libc::c_int) as libc::sighandler_t;
-        libc::sigemptyset(&mut action.sa_mask);
-        action.sa_flags = 0;
-        libc::sigaction(libc::SIGWINCH, &action, std::ptr::null_mut());
     }
+    let winch = match winch::install() {
+        Ok(fd) => fd,
+        Err(e) => {
+            unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSAFLUSH, &orig) };
+            eprintln!("granite-record: {e}");
+            return ExitCode::from(1);
+        }
+    };
 
     let mut buf = vec![0u8; 65536];
     loop {
-        if WINCH_PENDING.swap(false, Ordering::Relaxed) {
+        if winch::take(winch) {
             let new = host_size();
             unsafe { libc::ioctl(pty, libc::TIOCSWINSZ, &new) };
             log(file, Record::Size(Size { cols: new.ws_col, rows: new.ws_row }));
@@ -106,8 +102,9 @@ fn record(file: libc::c_int, cmd: &[*const libc::c_char]) -> ExitCode {
         let mut fds = [
             libc::pollfd { fd: libc::STDIN_FILENO, events: libc::POLLIN, revents: 0 },
             libc::pollfd { fd: pty, events: libc::POLLIN, revents: 0 },
+            libc::pollfd { fd: winch, events: libc::POLLIN, revents: 0 },
         ];
-        if unsafe { libc::poll(fds.as_mut_ptr(), 2, -1) } < 0 {
+        if unsafe { libc::poll(fds.as_mut_ptr(), 3, -1) } < 0 {
             if std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
                 continue;
             }
