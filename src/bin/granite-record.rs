@@ -10,7 +10,7 @@ use std::os::unix::ffi::OsStrExt as _;
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use granite::mux::{Winsize, write_all};
+use granite::mux::{Winsize, read, write_all};
 use granite::recording::{self, Record, Size};
 
 static WINCH_PENDING: AtomicBool = AtomicBool::new(false);
@@ -115,7 +115,7 @@ fn record(file: libc::c_int, cmd: &[*const libc::c_char]) -> ExitCode {
         }
 
         if fds[0].revents & libc::POLLIN != 0 {
-            let n = unsafe { libc::read(libc::STDIN_FILENO, buf.as_mut_ptr().cast(), buf.len()) };
+            let n = read(libc::STDIN_FILENO, &mut buf);
             if n <= 0 {
                 break;
             }
@@ -123,7 +123,7 @@ fn record(file: libc::c_int, cmd: &[*const libc::c_char]) -> ExitCode {
         }
 
         if fds[1].revents & (libc::POLLIN | libc::POLLHUP) != 0 {
-            let n = unsafe { libc::read(pty, buf.as_mut_ptr().cast(), buf.len()) };
+            let n = read(pty, &mut buf);
             if n <= 0 {
                 break;
             }

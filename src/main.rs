@@ -21,7 +21,7 @@ use std::path::Path;
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use granite::mux::{self, Mux, Winsize, now_ms, write_all};
+use granite::mux::{self, Mux, Winsize, now_ms, read, write_all};
 use libghostty_vt::log::{Level, Logger};
 
 const FRAME_MS: i64 = 16;
@@ -112,7 +112,7 @@ fn query_host(m: &mut Mux) -> Result<(), Box<dyn Error>> {
         if ready == 0 {
             break;
         }
-        let n = unsafe { libc::read(libc::STDIN_FILENO, buf[len..].as_mut_ptr().cast(), buf.len() - len) };
+        let n = read(libc::STDIN_FILENO, &mut buf[len..]);
         if n <= 0 {
             break;
         }
@@ -309,7 +309,7 @@ fn event_loop(m: &mut Mux) -> Result<u8, Box<dyn Error>> {
             break;
         }
         if fds[0].revents & libc::POLLIN != 0 {
-            let n = unsafe { libc::read(libc::STDIN_FILENO, buf.as_mut_ptr().cast(), buf.len()) };
+            let n = read(libc::STDIN_FILENO, &mut buf);
             if n <= 0 {
                 break;
             }
@@ -319,7 +319,7 @@ fn event_loop(m: &mut Mux) -> Result<u8, Box<dyn Error>> {
             if fd.revents & (libc::POLLIN | libc::POLLHUP) == 0 {
                 continue;
             }
-            let n = unsafe { libc::read(fd.fd, buf.as_mut_ptr().cast(), buf.len()) };
+            let n = read(fd.fd, &mut buf);
             if n > 0 {
                 m.panes[i].feed(&buf[..n as usize]);
                 continue;
