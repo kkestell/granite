@@ -302,8 +302,10 @@ impl Pane {
         self.state.held_since.get()
     }
 
-    /// Stop honoring a hold that has gone on too long.
+    /// End a hold that has gone on too long as if the program had ended it,
+    /// so its next mode 2026 set starts a new hold.
     pub fn end_hold(&mut self) -> Result<()> {
+        self.terminal.set_mode(Mode::SYNC_OUTPUT, false)?;
         self.set_held(false);
         Ok(())
     }
