@@ -1,0 +1,9 @@
+[package]
+name = "granite"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.90"
+
+[dependencies]
+# Built from vendor/ghostty, which is checked out at the commit this revision pins.
+libghostty-vt = { git = "https://github.com/Uzaaft/libghostty-rs.git", rev = "9ede35b8ea94a55ed3608408d67e102883129f1e", default-features = false }

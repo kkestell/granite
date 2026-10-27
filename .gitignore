@@ -1,4 +1,5 @@
-.zig-cache/
-zig-out/
-zig-pkg/
-.toolchain/
+/target/
+/.toolchain/
+/zig/.zig-cache/
+/zig/zig-out/
+/zig/zig-pkg/

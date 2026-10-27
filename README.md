@@ -1,16 +1,18 @@
 # granite
 
 A minimal terminal multiplexer written in Zig on Ghostty's `ghostty-vt`
-module. With no arguments it runs `claude` on the left, `codex` on the top
+module. The Zig version lives in `zig/`; a Rust port on
+[libghostty-rs](https://github.com/Uzaaft/libghostty-rs) is in progress at
+the top level. With no arguments it runs `claude` on the left, `codex` on the top
 right, and `opencode` on the bottom right. Each program runs in its own pty and terminal; granite redraws only
 the rows that changed.
 
 ```sh
-./zig-out/bin/granite                         # claude | codex over opencode
-./zig-out/bin/granite htop                    # one pane, no header or divider
-./zig-out/bin/granite claude :: codex         # two side-by-side commands
-./zig-out/bin/granite claude :: codex :: htop # left | top right over bottom right
-./zig-out/bin/granite sh -l :: htop           # arguments belong to each command
+./zig/zig-out/bin/granite                         # claude | codex over opencode
+./zig/zig-out/bin/granite htop                    # one pane, no header or divider
+./zig/zig-out/bin/granite claude :: codex         # two side-by-side commands
+./zig/zig-out/bin/granite claude :: codex :: htop # left | top right over bottom right
+./zig/zig-out/bin/granite sh -l :: htop           # arguments belong to each command
 ```
 
 - In split mode, **Ctrl-]** moves focus to the next live pane: left, then
@@ -48,34 +50,39 @@ the rows that changed.
 
 ## Layout
 
-- `src/main.zig`: granite's pty and host terminal handling and event loop
-- `src/mux.zig`: the Ghostty terminal and the renderer that redraws the host
-- `src/record.zig`: `granite-record`, which records a program's output
-- `test/`: the round-trip and live tests
-- `vendor/ghostty`: Ghostty source, used as a path dependency
+- `zig/src/main.zig`: granite's pty and host terminal handling and event loop
+- `zig/src/mux.zig`: the Ghostty terminal and the renderer that redraws the host
+- `zig/src/record.zig`: `granite-record`, which records a program's output
+- `zig/test/`: the round-trip and live tests
+- `zig/vendor/ghostty`: Ghostty source, used as a path dependency
+- `src/`: the Rust port
+- `vendor/ghostty`: Ghostty source at the commit libghostty-rs pins, which
+  `.cargo/config.toml` points the libghostty-vt build at
 - `.toolchain/zig-aarch64-macos-0.17.0`: Zig 0.17, which Ghostty requires
 
 ## Build
 
 ```sh
-make
+make zig
 ```
 
-`make` runs `zig build` with the bundled toolchain and installs the binary
-at `zig-out/bin/granite`. If the toolchain isn't in `.toolchain` yet, `make`
-downloads it from ziglang.org and checks its SHA-256 first; `make toolchain`
-does only that step. If `vendor/ghostty` isn't checked out, `make` runs
+`make zig` runs `zig build` in `zig/` with the bundled toolchain and
+installs the binary at `zig/zig-out/bin/granite`. `make` runs `cargo build`
+for the Rust port, which builds libghostty-vt with the same toolchain. If
+the toolchain isn't in `.toolchain` yet, `make` downloads it from
+ziglang.org and checks its SHA-256 first; `make toolchain` does only that
+step. If a Ghostty checkout isn't there, `make` runs
 `git submodule update --init` for it.
 
 ## Testing
 
 ```sh
-make test
+make zig-test
 ```
 
-`make test` runs `zig build test`, which runs two test binaries.
+`make zig-test` runs `zig build test` in `zig/`, which runs two test binaries.
 
-The round-trip test (`test/roundtrip.zig`) feeds program output to granite's
+The round-trip test (`zig/test/roundtrip.zig`) feeds program output to granite's
 terminal and renderer without a pty. After each chunk of output, granite
 renders a frame, the frame is fed to a second Ghostty terminal standing in
 for the host, and the host's screen is compared with the program's: text
@@ -84,17 +91,17 @@ attributes, the cursor, and the mirrored modes. A difference fails the test
 with a cell-by-cell report. Each input runs with its original chunk
 boundaries and with seeded random splits. The inputs are:
 
-- the fixtures in `test/fixtures.zig`
-- streams from the fuzzer in `test/fuzz.zig`; `-Dfuzz-iterations=N` and
+- the fixtures in `zig/test/fixtures.zig`
+- streams from the fuzzer in `zig/test/fuzz.zig`; `-Dfuzz-iterations=N` and
   `-Dfuzz-seed=N` set how many and where the seeds start (300 from seed 1 by
   default)
-- every `.rec` file in `test/recordings`
+- every `.rec` file in `zig/test/recordings`
 
 Fixtures marked `known` cover differences granite doesn't resolve, and
 pass while the difference remains.
 
-The live test (`test/live.zig`) runs granite in a pty with a scripted
-program (`test/child.zig`) inside it, and acts as the host terminal. It
+The live test (`zig/test/live.zig`) runs granite in a pty with a scripted
+program (`zig/test/child.zig`) inside it, and acts as the host terminal. It
 covers mode 2026 holds and their timeout, frame coalescing, resizing,
 mirroring and restoring input modes, query replies, input forwarding, and
 exit status. Split-mode tests cover legacy and Kitty Ctrl-] focus switching,
@@ -109,7 +116,7 @@ writes the output to a file with each read as its own record, along with
 the terminal size and every size change:
 
 ```sh
-./zig-out/bin/granite-record test/recordings/claude.rec claude
+./zig/zig-out/bin/granite-record zig/test/recordings/claude.rec claude
 ```
 
-Recordings in `test/recordings` are replayed by the round-trip test.
+Recordings in `zig/test/recordings` are replayed by the round-trip test.

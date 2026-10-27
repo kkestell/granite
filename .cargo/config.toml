@@ -1,0 +1,5 @@
+# Build libghostty-vt from the vendored Ghostty with the bundled Zig, rather
+# than fetching Ghostty and using whatever zig is on PATH.
+[env]
+GHOSTTY_SOURCE_DIR = { value = "vendor/ghostty", relative = true }
+ZIG = { value = ".toolchain/zig-aarch64-macos-0.17.0/zig", relative = true }

@@ -1,2 +1,2 @@
 .toolchain/
-zig-pkg/
+zig/zig-pkg/
