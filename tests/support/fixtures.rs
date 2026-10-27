@@ -1,4 +1,4 @@
-//! Hand-written cases ported from zig/test/fixtures.zig.
+//! Hand-written round-trip cases.
 use granite::recording::{Record, Size};
 pub struct Fixture {
     pub name: &'static str,

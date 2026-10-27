@@ -1,9 +1,9 @@
 //! granite-record: runs a program in a pty and passes its input and output
 //! through unchanged, while logging the output to a file with each read()
-//! as its own record (see recording.rs). Recordings in zig/test/recordings
+//! as its own record (see recording.rs). Recordings in tests/recordings
 //! are replayed by the round-trip test.
 //!
-//!   granite-record zig/test/recordings/claude.rec claude
+//!   granite-record tests/recordings/claude.rec claude
 
 use std::ffi::CString;
 use std::os::unix::ffi::OsStrExt as _;

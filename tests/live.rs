@@ -1,5 +1,5 @@
 //! Real-pty tests of granite, with a Ghostty terminal acting as its host.
-//! Ported from zig/test/live.zig; the child is src/bin/granite-test-child.rs.
+//! The child is src/bin/granite-test-child.rs.
 use std::cell::Cell;
 use std::ffi::CString;
 use std::rc::Rc;

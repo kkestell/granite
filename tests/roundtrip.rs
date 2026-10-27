@@ -1,5 +1,5 @@
 //! Program output -> mux -> stand-in host terminal, compared after every frame.
-//! Port of zig/test/roundtrip.zig; the twin avoids consuming mux dirty flags.
+//! The twin avoids consuming mux dirty flags.
 #[path = "support/fixtures.rs"]
 mod fixtures;
 #[path = "support/fuzz.rs"]
@@ -209,7 +209,7 @@ fn fuzz() {
 }
 fn recording(name: &str) {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("zig/test/recordings")
+        .join("tests/recordings")
         .join(name);
     let data = std::fs::read(&path).unwrap();
     let mut reader = Reader::new(&data).unwrap();
@@ -457,7 +457,7 @@ mod fixtures_tests {
 #[test]
 fn recordings() {
     // Discover inputs rather than maintaining a list, so new captures are replayed too.
-    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("zig/test/recordings");
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/recordings");
     let mut names = Vec::new();
     for entry in std::fs::read_dir(dir).unwrap() {
         let entry = entry.unwrap();

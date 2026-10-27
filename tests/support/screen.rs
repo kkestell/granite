@@ -1,4 +1,4 @@
-//! Independent snapshots and cell-level diagnostics (ported from screen.zig).
+//! Independent snapshots and cell-level diagnostics .
 //! Reading a fresh render state consumes dirty flags: never snapshot the mux's terminal.
 use libghostty_vt::error::Result;
 use libghostty_vt::render::{CellIterator, Colors, CursorVisualStyle, RowIterator};

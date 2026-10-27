@@ -4,21 +4,14 @@ ZIG_NAME := zig-$(ZIG_TARGET)-$(ZIG_VERSION)
 ZIG_SHA256 := b607e9b9234790a008116ae5bdb71c6243b84b9fb42a53a9e70fde41c06c536a
 ZIG := .toolchain/$(ZIG_NAME)/zig
 GHOSTTY := vendor/ghostty/build.zig
-ZIG_GHOSTTY := zig/vendor/ghostty/build.zig
 
-.PHONY: build test zig zig-test toolchain
+.PHONY: build test toolchain
 
 build: $(ZIG) $(GHOSTTY)
 	cargo build
 
 test: $(ZIG) $(GHOSTTY)
 	cargo test
-
-zig: $(ZIG) $(ZIG_GHOSTTY)
-	cd zig && ../$(ZIG) build
-
-zig-test: $(ZIG) $(ZIG_GHOSTTY)
-	cd zig && ../$(ZIG) build test
 
 toolchain: $(ZIG)
 
@@ -34,6 +27,3 @@ $(ZIG):
 
 $(GHOSTTY):
 	git submodule update --init vendor/ghostty
-
-$(ZIG_GHOSTTY):
-	git submodule update --init zig/vendor/ghostty
