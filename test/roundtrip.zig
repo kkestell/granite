@@ -69,14 +69,14 @@ fn winsize(s: recording.Size) std.posix.winsize {
 /// whose host screen differs from the program's, or null if none do.
 fn roundTrip(label: []const u8, initial: recording.Size, records: []const Record) !?[]u8 {
     var m: mux.Mux = undefined;
-    try m.init(io, gpa, winsize(initial), null);
+    try m.init(io, gpa, winsize(initial), &.{"test"});
     defer m.deinit();
     try m.useHostReplies(host_replies);
 
     var twin: Term = undefined;
     try twin.init(initial);
     defer twin.deinit();
-    twin.terminal.flags.shell_redraws_prompt = m.terminal.flags.shell_redraws_prompt;
+    twin.terminal.flags.shell_redraws_prompt = m.panes[0].terminal.flags.shell_redraws_prompt;
 
     var host: Term = undefined;
     try host.init(initial);
@@ -86,7 +86,7 @@ fn roundTrip(label: []const u8, initial: recording.Size, records: []const Record
     for (records, 0..) |record, i| {
         switch (record) {
             .output => |data| {
-                m.feed(data);
+                m.panes[0].feed(data);
                 twin.stream.nextSlice(data);
             },
             .size => |s| {
@@ -96,11 +96,12 @@ fn roundTrip(label: []const u8, initial: recording.Size, records: []const Record
             },
         }
         // Granite doesn't draw while the program holds rendering.
-        if (m.held) continue;
+        if (m.panes[0].held) continue;
         if (try frame(&m, &twin, &host)) |diff| return try report(label, records, i, diff);
     }
 
     // The hold times out eventually, and granite draws what it has.
+    m.panes[0].held = false;
     if (try frame(&m, &twin, &host)) |diff| return try report(label, records, records.len, diff);
     return null;
 }

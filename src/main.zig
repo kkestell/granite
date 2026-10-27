@@ -1,14 +1,14 @@
-//! A minimal terminal multiplexer: one window, one pane, no detach.
+//! A minimal terminal multiplexer with one or two panes, no detach.
 //!
-//! Runs a program (default: claude) in a pty, feeds its output into a
-//! Ghostty terminal, and redraws the host terminal from the render state.
-//! Keyboard and mouse input from the host is forwarded to the pty as-is;
-//! the input modes the program enables (cursor keys, mouse, focus,
-//! bracketed paste, Kitty keyboard) are mirrored onto the host terminal so
-//! the host encodes input the way the program expects.
+//! With no arguments, runs claude on the left and codex on the right.
+//! Ctrl-] switches focus. A command runs alone with unchanged input and
+//! no chrome; separate two commands with a lone :: to split them.
+//! Each program has its own pty and Ghostty terminal. The focused pane's
+//! input modes are mirrored onto the host, and only dirty rows redraw.
 //!
-//!   ./zig-out/bin/granite            # runs claude
-//!   ./zig-out/bin/granite htop       # runs any other program
+//!   ./zig-out/bin/granite
+//!   ./zig-out/bin/granite htop
+//!   ./zig-out/bin/granite claude :: codex
 
 const std = @import("std");
 const mux = @import("mux.zig");
@@ -92,8 +92,10 @@ fn hostSize() posix.winsize {
 
 fn resize(m: *Mux) !void {
     const ws = hostSize();
-    _ = c.ioctl(m.pty.?, TIOCSWINSZ, &ws);
     try m.resize(ws);
+    for (m.panes[0..m.count]) |*p| if (p.pty) |pty| {
+        _ = c.ioctl(pty, TIOCSWINSZ, &p.ws);
+    };
 }
 
 //------------------------------------------------------------------------
@@ -101,41 +103,77 @@ fn resize(m: *Mux) !void {
 pub fn main(init: std.process.Init) !u8 {
     const gpa = init.gpa;
     const args = init.minimal.args.vector;
-    const default_cmd = [_:null]?[*:0]const u8{"claude"};
-    const cmd: [*:null]const ?[*:0]const u8 = if (args.len > 1)
-        @ptrCast(args.ptr + 1)
-    else
-        &default_cmd;
+    const claude = [_:null]?[*:0]const u8{"claude"};
+    const codex = [_:null]?[*:0]const u8{"codex"};
+    var commands = [_][*:null]const ?[*:0]const u8{ &claude, &codex };
+    var count: usize = 2;
+    var left_args: ?[:null]?[*:0]const u8 = null;
+    defer if (left_args) |a| gpa.free(a);
+    if (args.len > 1) {
+        var separator: ?usize = null;
+        for (args[1..], 1..) |arg, i| {
+            if (std.mem.eql(u8, std.mem.span(arg), "::")) {
+                if (separator != null or i == 1 or i + 1 == args.len) {
+                    std.debug.print("granite: expected cmd args... :: cmd args...\n", .{});
+                    return 2;
+                }
+                separator = i;
+            }
+        }
+        if (separator) |at| {
+            const left = try gpa.allocSentinel(?[*:0]const u8, at - 1, null);
+            left_args = left;
+            for (args[1..at], left) |arg, *dest| dest.* = arg;
+            commands[0] = left.ptr;
+            commands[1] = @ptrCast(args.ptr + at + 1);
+        } else {
+            count = 1;
+            commands[0] = @ptrCast(args.ptr + 1);
+        }
+    }
 
     if (c.isatty(posix.STDIN_FILENO) == 0 or c.isatty(posix.STDOUT_FILENO) == 0) {
         std.debug.print("granite: stdin and stdout must be a terminal\n", .{});
         return 1;
     }
 
-    const ws = hostSize();
-
-    var pty: posix.fd_t = undefined;
-    const pid = forkpty(&pty, null, null, &ws);
-    if (pid < 0) {
-        perror("forkpty");
-        return 1;
-    }
-    if (pid == 0) {
-        _ = setenv("TERM", "xterm-256color", 1);
-        _ = execvp(cmd[0].?, cmd);
-        perror(cmd[0].?);
-        c._exit(127);
-    }
-    errdefer posix.kill(pid, .TERM) catch {};
-
+    var labels: [2][]const u8 = undefined;
+    for (commands[0..count], labels[0..count]) |cmd, *label| label.* = std.fs.path.basename(std.mem.span(cmd[0].?));
     var m: Mux = undefined;
-    try m.init(init.io, gpa, ws, pty);
+    try m.init(init.io, gpa, hostSize(), labels[0..count]);
     defer m.deinit();
+    defer for (m.panes[0..count]) |*p| {
+        if (p.pty) |pty| _ = c.close(pty);
+    };
+    errdefer for (m.panes[0..count]) |*p| {
+        if (p.pid) |pid| if (p.status == null) {
+            posix.kill(pid, .TERM) catch {};
+            _ = c.waitpid(pid, null, 0);
+        };
+    };
+
+    for (m.panes[0..count], commands[0..count]) |*p, cmd| {
+        var pty: posix.fd_t = undefined;
+        const pid = forkpty(&pty, null, null, &p.ws);
+        if (pid < 0) return error.ForkptyFailed;
+        if (pid == 0) {
+            // The second child must not retain the first child's master.
+            for (m.panes[0..count]) |*other| if (other.pty) |fd| {
+                _ = c.close(fd);
+            };
+            _ = setenv("TERM", "xterm-256color", 1);
+            _ = execvp(cmd[0].?, cmd);
+            perror(cmd[0].?);
+            c._exit(127);
+        }
+        p.pty = pty;
+        p.pid = pid;
+    }
     try resize(&m);
 
     const orig_termios = try posix.tcgetattr(posix.STDIN_FILENO);
     setupHost(orig_termios);
-    errdefer restoreHost(&m, orig_termios);
+    defer restoreHost(&m, orig_termios);
     try queryHost(&m);
 
     posix.sigaction(.WINCH, &.{
@@ -144,68 +182,78 @@ pub fn main(init: std.process.Init) !u8 {
         .flags = 0,
     }, null);
 
-    var dirty = true;
     var last_render: i64 = 0;
     var buf: [65536]u8 = undefined;
-
-    while (true) {
-        if (winch_pending.swap(false, .monotonic)) {
-            try resize(&m);
-            dirty = true;
-        }
-
+    var live = count;
+    while (live > 0) {
+        if (winch_pending.swap(false, .monotonic)) try resize(&m);
         const now = nowMs();
-        if (m.held and now - m.held_since > hold_timeout_ms) m.held = false;
-
-        if (dirty and !m.held and now - last_render >= frame_ms) {
+        for (m.panes[0..count]) |*p| {
+            if (p.held and now - p.held_since >= hold_timeout_ms) p.held = false;
+        }
+        if (m.needsRender() and now - last_render >= frame_ms) {
             try mux.render(&m);
             last_render = now;
-            dirty = false;
         }
         if (m.out.written().len > 0) flush(&m);
 
         var timeout: i64 = -1;
-        if (m.held) {
-            timeout = hold_timeout_ms - (now - m.held_since);
-        } else if (dirty) {
-            timeout = frame_ms - (now - last_render);
+        if (m.needsRender()) timeout = @max(0, frame_ms - (now - last_render));
+        for (m.panes[0..count]) |*p| {
+            if (p.held) {
+                const left = @max(0, hold_timeout_ms - (now - p.held_since));
+                timeout = if (timeout < 0) left else @min(timeout, left);
+            }
         }
-        if (dirty and timeout < 0) timeout = 0;
-
         var fds = [_]posix.pollfd{
             .{ .fd = posix.STDIN_FILENO, .events = posix.POLL.IN, .revents = 0 },
-            .{ .fd = pty, .events = posix.POLL.IN, .revents = 0 },
+            .{ .fd = m.panes[0].pty orelse -1, .events = posix.POLL.IN, .revents = 0 },
+            .{ .fd = if (count == 2) m.panes[1].pty orelse -1 else -1, .events = posix.POLL.IN, .revents = 0 },
         };
-        // A raw poll, so that SIGWINCH interrupts the wait.
-        if (c.poll(&fds, fds.len, @intCast(timeout)) < 0) {
+        // Raw poll lets SIGWINCH interrupt the wait.
+        if (c.poll(&fds, @intCast(count + 1), @intCast(timeout)) < 0) {
             if (posix.errno(-1) == .INTR) continue;
             break;
         }
-
         if (fds[0].revents & posix.POLL.IN != 0) {
             const n = posix.read(posix.STDIN_FILENO, &buf) catch break;
             if (n == 0) break;
-            writeAll(pty, buf[0..n]);
+            m.input(buf[0..n]);
         }
-
-        if (fds[1].revents & (posix.POLL.IN | posix.POLL.HUP) != 0) {
-            // The program exited.
-            const n = posix.read(pty, &buf) catch break;
-            if (n == 0) break;
-            m.feed(buf[0..n]);
-            dirty = true;
+        for (m.panes[0..count], fds[1 .. count + 1], 0..) |*p, fd, i| {
+            if (fd.revents & (posix.POLL.IN | posix.POLL.HUP) == 0) continue;
+            const n = posix.read(fd.fd, &buf) catch 0;
+            if (n > 0) {
+                p.feed(buf[0..n]);
+                continue;
+            }
+            var status: c_int = 0;
+            _ = c.waitpid(p.pid.?, &status, 0);
+            p.status = exitStatus(@bitCast(status));
+            _ = c.close(p.pty.?);
+            p.pty = null;
+            p.held = false;
+            live -= 1;
+            if (count == 2) m.chrome_dirty = true;
+            if (count == 2 and m.focus == i) m.setFocus(1 - i);
         }
     }
-
-    if (dirty) {
-        try mux.render(&m);
-        flush(&m);
+    // Preserve a short-lived child's final output, including held output.
+    for (m.panes[0..count]) |*p| p.held = false;
+    if (m.needsRender()) try mux.render(&m);
+    flush(&m);
+    for (m.panes[0..count]) |*p| {
+        if (p.status == null) {
+            var status: c_int = 0;
+            _ = c.waitpid(p.pid.?, &status, 0);
+            p.status = exitStatus(@bitCast(status));
+        }
     }
-    restoreHost(&m, orig_termios);
-    var status: c_int = 0;
-    _ = c.waitpid(pid, &status, 0);
+    for (m.panes[0..count]) |*p| if (p.status.? != 0) return p.status.?;
+    return 0;
+}
 
-    const s: u32 = @bitCast(status);
-    if (posix.W.IFSIGNALED(s)) return 128 + @as(u8, @intCast(@backingInt(posix.W.TERMSIG(s))));
-    return posix.W.EXITSTATUS(s);
+fn exitStatus(status: u32) u8 {
+    if (posix.W.IFSIGNALED(status)) return 128 + @as(u8, @intCast(@backingInt(posix.W.TERMSIG(status))));
+    return posix.W.EXITSTATUS(status);
 }

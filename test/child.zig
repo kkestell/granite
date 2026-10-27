@@ -9,6 +9,7 @@
 //!   child burst <lines>          print many lines as fast as possible
 //!   child size                   print the tty size at start and on SIGWINCH
 //!   child modes                  enable input modes, echo input until 'q'
+//!   child input <label> <plain|modes> <exit-status> [file]   echo and record input
 //!   child query <file>           send queries and write the replies to file
 
 const std = @import("std");
@@ -132,6 +133,29 @@ pub fn main(init: std.process.Init) !u8 {
         while (readByte(10_000)) |b| {
             if (b == 'q') return 0;
             print("\r\ngot {d}", .{b});
+        }
+        return 1;
+    }
+
+    if (std.mem.eql(u8, scenario, "input")) {
+        rawMode();
+        const label = std.mem.span(args[2]);
+        const status = try std.fmt.parseInt(u8, std.mem.span(args[4]), 10);
+        const file = if (args.len > 5)
+            c.open(args[5], .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(c.mode_t, 0o644))
+        else
+            -1;
+        defer if (file >= 0) {
+            _ = c.close(file);
+        };
+        if (std.mem.eql(u8, std.mem.span(args[3]), "modes")) {
+            write("\x1b[?1h\x1b[?1000h\x1b[?1006h\x1b[?2004h\x1b[?1004h\x1b=\x1b[>1u\x1b[5 q");
+        }
+        print("\x1b]0;{s}\x07{s} ready", .{ label, label });
+        while (readByte(10_000)) |b| {
+            if (file >= 0) _ = c.write(file, @ptrCast(&b), 1);
+            if (b == 'q') return status;
+            print("\r\n{s} got {d}", .{ label, b });
         }
         return 1;
     }

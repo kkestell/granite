@@ -86,6 +86,15 @@ const Host = struct {
         return h;
     }
 
+    fn startSplit(left: []const []const u8, right: []const []const u8, cols: u16, rows: u16) !*Host {
+        var args: std.ArrayList([]const u8) = .empty;
+        defer args.deinit(gpa);
+        try args.appendSlice(gpa, left);
+        try args.appendSlice(gpa, &.{ "::", options.child });
+        try args.appendSlice(gpa, right);
+        return start(args.items, cols, rows);
+    }
+
     fn deinit(h: *Host) void {
         if (h.status == null) {
             posix.kill(h.pid, .KILL) catch {};
@@ -388,4 +397,184 @@ test "queries are answered" {
         };
         at = i + e.len;
     }
+}
+
+test "split routes input and switches focus with legacy Ctrl-]" {
+    const h = try Host.startSplit(&.{ "input", "left", "plain", "0" }, &.{ "input", "right", "plain", "0" }, 81, 12);
+    defer h.deinit();
+    try h.waitForScreen("left ready");
+    try h.waitForScreen("right ready");
+    h.send("a");
+    try h.waitForScreen("left got 97");
+    h.send("\x1db");
+    try h.waitForScreen("right got 98");
+    h.send("\x1dc");
+    try h.waitForScreen("left got 99");
+    for ([_][]const u8{ "right got 97", "left got 98", "right got 99", "got 29" }) |text| {
+        try std.testing.expect(std.mem.indexOf(u8, h.output.items, text) == null);
+    }
+    h.send("q");
+    try h.waitForScreen("(exited 0)");
+    h.send("q");
+    try std.testing.expectEqual(0, try h.wait());
+}
+
+test "split consumes Kitty Ctrl-] press repeat and release" {
+    const h = try Host.startSplit(&.{ "input", "left", "plain", "0" }, &.{ "input", "right", "plain", "0" }, 81, 12);
+    defer h.deinit();
+    try h.waitForScreen("left ready");
+    try h.waitForScreen("right ready");
+    h.send("\x1b[93;5u\x1b[93;5:2;93u\x1b[93;5:3u\x1b[97;1ua");
+    try h.waitForScreen("right got 97");
+    // A second press switches back; repeats and releases did not switch.
+    h.send("\x1b[93:93;5:1;93ub");
+    try h.waitForScreen("left got 98");
+    try std.testing.expect(std.mem.indexOf(u8, h.output.items, "left got 27") == null);
+    // The unrelated CSI-u key was forwarded to the right pane unchanged.
+    try std.testing.expect(std.mem.indexOf(u8, h.output.items, "right got 27") != null);
+    h.send("q");
+    try h.waitForScreen("(exited 0)");
+    h.send("q");
+    try std.testing.expectEqual(0, try h.wait());
+}
+
+test "split modes cursor title and focus reports follow focus" {
+    const h = try Host.startSplit(&.{ "input", "left", "modes", "0" }, &.{ "input", "right", "plain", "0" }, 81, 16);
+    defer h.deinit();
+    try h.waitForScreen("left ready");
+    try h.waitForScreen("right ready");
+    try h.waitUntil(5000, true, struct {
+        fn f(host: *Host, enabled: bool) bool {
+            return host.mode(2004) == enabled and host.terminal.screens.active.kitty_keyboard.current().int() == @as(u8, if (enabled) 1 else 0);
+        }
+    }.f);
+    try std.testing.expectEqualStrings("left", h.terminal.getTitle().?);
+    h.send("\x1d");
+    try h.waitForScreen("left got 79"); // ESC [ O: focus out
+    try h.waitUntil(5000, false, struct {
+        fn f(host: *Host, enabled: bool) bool {
+            return host.mode(2004) == enabled and host.terminal.screens.active.kitty_keyboard.current().int() == 0;
+        }
+    }.f);
+    for ([_]bool{ h.mode(1), h.mode(66), h.mode(1000), h.mode(1004), h.mode(1006), h.mode(2004) }) |on| try std.testing.expect(!on);
+    try std.testing.expectEqual(.block, h.terminal.screens.active.cursor.cursor_style);
+    try std.testing.expectEqualStrings("right", h.terminal.getTitle().?);
+    h.send("\x1d");
+    try h.waitForScreen("left got 73"); // ESC [ I: focus in
+    try h.waitUntil(5000, true, struct {
+        fn f(host: *Host, enabled: bool) bool {
+            return host.mode(2004) == enabled and host.terminal.screens.active.kitty_keyboard.current().int() == 1;
+        }
+    }.f);
+    for ([_]bool{ h.mode(1), h.mode(66), h.mode(1000), h.mode(1004), h.mode(1006), h.mode(2004) }) |on| try std.testing.expect(on);
+    try std.testing.expectEqual(.bar, h.terminal.screens.active.cursor.cursor_style);
+    try std.testing.expectEqualStrings("left", h.terminal.getTitle().?);
+    h.send("q");
+    try h.waitForScreen("(exited 0)");
+    h.send("q");
+    try std.testing.expectEqual(0, try h.wait());
+}
+
+test "split stays alive after one exit and returns first nonzero status in pane order" {
+    const h = try Host.startSplit(&.{ "exit", "7", "left final" }, &.{ "input", "right", "plain", "9" }, 81, 12);
+    defer h.deinit();
+    try h.waitForScreen("(exited 7)");
+    try h.waitForScreen("left final");
+    try h.waitForScreen("right ready");
+    try std.testing.expect(!h.eof);
+    // Focus moved to the surviving pane without a keypress.
+    h.send("a");
+    try h.waitForScreen("right got 97");
+    h.send("q");
+    try std.testing.expectEqual(7, try h.wait());
+
+    const right_exits_first = try Host.startSplit(&.{ "input", "left", "plain", "0" }, &.{ "exit", "9", "right final" }, 81, 12);
+    defer right_exits_first.deinit();
+    try right_exits_first.waitForScreen("(exited 9)");
+    try right_exits_first.waitForScreen("right final");
+    try right_exits_first.waitForScreen("left ready");
+    // A focus toggle cannot select an exited pane.
+    right_exits_first.send("\x1da");
+    try right_exits_first.waitForScreen("left got 97");
+    right_exits_first.send("q");
+    try std.testing.expectEqual(9, try right_exits_first.wait());
+}
+
+test "split resizes each child and preserves the divider" {
+    const h = try Host.startSplit(&.{"size"}, &.{"size"}, 81, 12);
+    defer h.deinit();
+    try h.waitUntil(5000, {}, struct {
+        fn f(host: *Host, _: void) bool {
+            const text = host.screen() catch return false;
+            return std.mem.count(u8, text, "size 40x11") == 2;
+        }
+    }.f);
+    try h.resize(100, 9);
+    try h.waitForScreen("size 49x8");
+    try h.waitForScreen("size 50x8");
+    try std.testing.expect(std.mem.count(u8, try h.screen(), "│") == 9);
+    h.send("q");
+    try h.waitForScreen("(exited 0)");
+    h.send("q");
+    try std.testing.expectEqual(0, try h.wait());
+}
+
+test "split translates SGR mouse reports and drops reports outside focus and other formats" {
+    var path_buf: [128]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, "/tmp/granite-live-{d}.mouse", .{c.getpid()});
+    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+    const h = try Host.startSplit(&.{ "input", "left", "plain", "0" }, &.{ "input", "right", "plain", "0", path }, 81, 20);
+    defer h.deinit();
+    try h.waitForScreen("left ready");
+    try h.waitForScreen("right ready");
+    h.send("\x1d\x1b[<0;43;4M\x1b[<0;43;4m\x1b[<0;1;4M\x1b[<0;43;1M\x1b[<0;41;4M\x1b[M !!\x1b[M \xc2!\x1b[32;43;4M!");
+    try h.waitForScreen("right got 33");
+    const recorded = try std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .unlimited);
+    defer gpa.free(recorded);
+    try std.testing.expectEqualStrings("\x1b[<0;2;3M\x1b[<0;2;3m!", recorded);
+    h.send("q");
+    try h.waitForScreen("(exited 0)");
+    h.send("q");
+    try std.testing.expectEqual(0, try h.wait());
+}
+
+test "split keeps rendering the other pane during a synchronized-output hold" {
+    const h = try Host.startSplit(&.{"hold-forever"}, &.{ "input", "right", "plain", "0" }, 81, 12);
+    defer h.deinit();
+    try h.waitForScreen("start");
+    try h.waitForScreen("right ready");
+    // Give the left child time to begin its hold, then draw on the right.
+    const deadline = mux.nowMs() + 250;
+    while (mux.nowMs() < deadline) try h.pump(20);
+    h.send("\x1da");
+    try h.waitForScreen("right got 97");
+    try std.testing.expect(std.mem.indexOf(u8, try h.screen(), "stuck") == null);
+    try h.waitForScreen("stuck");
+    h.send("q");
+    try h.waitForScreen("(exited 0)");
+    h.send("q");
+    try std.testing.expectEqual(0, try h.wait());
+}
+
+test "split renders wide characters at each pane's offset" {
+    const h = try Host.startSplit(&.{ "input", "界L", "plain", "0" }, &.{ "input", "界R", "plain", "0" }, 81, 12);
+    defer h.deinit();
+    try h.waitForScreen("界L ready");
+    try h.waitForScreen("界R ready");
+    var rows = std.mem.splitScalar(u8, try h.screen(), '\n');
+    _ = rows.next(); // header
+    try std.testing.expectEqualStrings("界L ready                               │界R ready", rows.next().?);
+    const cursor = h.terminal.screens.active.cursor;
+    try std.testing.expectEqual(1, cursor.y);
+    try std.testing.expectEqual(9, cursor.x);
+    h.send("\x1d");
+    try h.waitUntil(5000, {}, struct {
+        fn f(host: *Host, _: void) bool {
+            return host.terminal.screens.active.cursor.x == 50;
+        }
+    }.f);
+    h.send("q");
+    try h.waitForScreen("(exited 0)");
+    h.send("q");
+    try std.testing.expectEqual(0, try h.wait());
 }

@@ -1,22 +1,29 @@
 # granite
 
-A minimal terminal multiplexer with one window and one pane, written in Zig
-on Ghostty's `ghostty-vt` module. It runs a program (`claude` by default) in
-a pty, feeds the program's output into a Ghostty terminal, and redraws the
-host terminal from the render state, drawing only the rows that changed.
+A minimal terminal multiplexer written in Zig on Ghostty's `ghostty-vt`
+module. With no arguments it runs `claude` on the left and `codex` on the
+right. Each program runs in its own pty and terminal; granite redraws only
+the rows that changed.
 
 ```sh
-./zig-out/bin/granite            # runs claude
-./zig-out/bin/granite htop       # runs any other program
+./zig-out/bin/granite                         # claude | codex
+./zig-out/bin/granite htop                    # one pane, no header or divider
+./zig-out/bin/granite claude :: codex         # two explicit commands
+./zig-out/bin/granite sh -l :: htop           # arguments belong to each command
 ```
 
-- Keyboard and mouse input is forwarded to the program unchanged. The input
-  modes the program enables (application cursor keys and keypad, mouse
-  tracking and formats, focus events, bracketed paste, Alt and backspace
-  handling, Kitty keyboard flags) are mirrored onto the host terminal, so
-  the host encodes input the way the program expects. Reverse video and
-  grapheme clustering are mirrored too, so the host draws the screen the
-  way the program sees it.
+- In split mode, **Ctrl-]** switches focus between live panes. The header
+  highlights the focused program, and shows each program's exit status.
+  Each pane gets half the width, with a divider between them; the header
+  uses the first row.
+- Keyboard input goes to the focused pane. SGR cell-coordinate mouse reports are translated
+  into its coordinates; reports outside that pane and other mouse formats
+  are dropped in split mode. A single command receives all input unchanged.
+- The focused program's input modes (application cursor keys and keypad,
+  mouse tracking and formats, focus events, bracketed paste, Alt and
+  backspace handling, Kitty keyboard flags) are mirrored onto the host
+  terminal. Reverse video and grapheme clustering are mirrored too. Programs
+  requesting focus events receive notifications when pane focus changes.
 - Device attribute and size queries are answered through terminal effects,
   and the terminal writes its replies back to the pty.
 - At startup granite asks the host for its default foreground and background
@@ -25,11 +32,13 @@ host terminal from the render state, drawing only the rows that changed.
   graphemes (mode 2027) and starts the terminal in the same mode, so both
   agree on character widths.
 - Frames are wrapped in synchronized output and limited to about 60 per
-  second. While the program holds rendering (mode 2026), drawing waits for
-  up to one second.
-- Window title changes and the bell are passed through to the host.
-- Resizing the host window resizes the pty and the terminal.
-- When the program exits, granite exits with the same status.
+  second. While a program holds rendering (mode 2026), its pane waits for
+  up to one second; the other pane continues drawing.
+- The focused pane controls the host title. Bells from either pane pass through.
+- Resizing the host window resizes both ptys and terminals.
+- An exited pane keeps its last screen, and focus moves to the surviving
+  program. Granite exits when all programs have exited, returning the first
+  nonzero status in pane order, or zero. A single command keeps its exit status.
 
 ## Layout
 
@@ -82,7 +91,9 @@ The live test (`test/live.zig`) runs granite in a pty with a scripted
 program (`test/child.zig`) inside it, and acts as the host terminal. It
 covers mode 2026 holds and their timeout, frame coalescing, resizing,
 mirroring and restoring input modes, query replies, input forwarding, and
-exit status.
+exit status. Split-mode tests cover legacy and Kitty Ctrl-] focus switching,
+focused modes, cursor and title, focus events, independent holds, per-pane
+resizing, mouse coordinates, and programs exiting at different times.
 
 ### Recording
 

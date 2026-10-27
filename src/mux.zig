@@ -1,7 +1,6 @@
-//! The terminal side of granite: a Ghostty terminal fed with the program's
-//! output, and the renderer that redraws the host terminal from it. The
-//! pty and the host terminal stay in main.zig, so this can run without
-//! either.
+//! Per-pane Ghostty terminals, host input routing, and rendering for one
+//! program or two side-by-side programs. Terminals can run without ptys
+//! for round-trip tests.
 
 const std = @import("std");
 const vt = @import("ghostty-vt");
@@ -35,98 +34,262 @@ pub const mirrored_modes = [_]u16{
     2027, // grapheme clustering
 };
 
-pub const Mux = struct {
-    gpa: std.mem.Allocator,
-    /// Where the terminal writes its replies. Replies are dropped when null.
-    pty: ?posix.fd_t,
+/// Per-program state. Initialize in place: effects recover this Pane from
+/// the stream handler's address, and the pane must not move afterwards.
+pub const Pane = struct {
+    host: *Mux,
+    pty: ?posix.fd_t = null,
+    pid: ?c.pid_t = null,
+    status: ?u8 = null,
+    label: []const u8,
     ws: posix.winsize,
+    row: u16,
+    col: u16,
     terminal: vt.Terminal,
     stream: vt.TerminalStream,
     render_state: vt.RenderState = .empty,
-    /// Output for the host terminal, written by `render` and the effects.
-    out: std.Io.Writer.Allocating,
     held: bool = false,
     held_since: i64 = 0,
-    /// The host screen was cleared, so the next frame redraws every row.
     redraw: bool = true,
-    /// The mirrored modes as last sent to the host, which starts out with
-    /// the defaults.
-    host_modes: [mirrored_modes.len]bool = @splat(false),
-    host_kitty_flags: u8 = 0,
+    dirty: bool = true,
 
-    /// Initialize in place: the terminal effects find the Mux from the
-    /// handler's address, so it must not move afterwards.
-    pub fn init(m: *Mux, io: std.Io, gpa: std.mem.Allocator, ws: posix.winsize, pty: ?posix.fd_t) !void {
-        m.* = .{
-            .gpa = gpa,
-            .pty = pty,
-            .ws = ws,
-            .terminal = try .init(io, gpa, .{ .cols = ws.col, .rows = ws.row }),
+    fn init(p: *Pane, m: *Mux, io: std.Io, label: []const u8, index: usize) !void {
+        const layout = m.layout(index);
+        p.* = .{
+            .host = m,
+            .label = label,
+            .ws = layout.ws,
+            .row = layout.row,
+            .col = layout.col,
+            .terminal = try .init(io, m.gpa, .{ .cols = layout.ws.col, .rows = layout.ws.row }),
             .stream = undefined,
-            .out = .init(gpa),
         };
-
-        // Prompts can't be assumed to redraw on resize without Ghostty's
-        // shell integration. Shells can still opt in with OSC 133;A;redraw=1.
-        m.terminal.flags.shell_redraws_prompt = .false;
-
-        var handler = m.terminal.vtHandler();
+        // Prompts can't be assumed to redraw without shell integration.
+        p.terminal.flags.shell_redraws_prompt = .false;
+        var handler = p.terminal.vtHandler();
         handler.effects.write_pty = &writePty;
         handler.effects.bell = &bell;
         handler.effects.title_changed = &titleChanged;
         handler.effects.device_attributes = &deviceAttributes;
         handler.effects.size = &size;
         handler.effects.render_hold = &renderHold;
-        m.stream = .init(.{ .allocator = gpa, .handler = handler });
+        p.stream = .init(.{ .allocator = m.gpa, .handler = handler });
+    }
+
+    fn deinit(p: *Pane) void {
+        p.stream.deinit();
+        p.render_state.deinit(p.host.gpa);
+        p.terminal.deinit(p.host.gpa);
+    }
+
+    pub fn feed(p: *Pane, data: []const u8) void {
+        // A leading zero-width character can attach without dirtying a row.
+        p.terminal.screens.active.cursorMarkDirty();
+        p.stream.nextSlice(data);
+        p.dirty = true;
+    }
+
+    fn fromHandler(handler: *Handler) *Pane {
+        const stream: *vt.TerminalStream = @fieldParentPtr("handler", handler);
+        return @fieldParentPtr("stream", stream);
+    }
+
+    fn send(p: *Pane, data: []const u8) void {
+        if (p.pty) |pty| writeAll(pty, data);
+    }
+};
+
+pub const Mux = struct {
+    gpa: std.mem.Allocator,
+    ws: posix.winsize,
+    panes: [2]Pane = undefined,
+    count: usize,
+    focus: usize = 0,
+    out: std.Io.Writer.Allocating,
+    chrome_dirty: bool = true,
+    host_modes: [mirrored_modes.len]bool = @splat(false),
+    host_kitty_flags: u8 = 0,
+
+    pub fn init(m: *Mux, io: std.Io, gpa: std.mem.Allocator, ws: posix.winsize, labels: []const []const u8) !void {
+        std.debug.assert(labels.len == 1 or labels.len == 2);
+        m.* = .{ .gpa = gpa, .ws = ws, .count = labels.len, .out = .init(gpa), .chrome_dirty = labels.len == 2 };
+        errdefer m.out.deinit();
+        var initialized: usize = 0;
+        errdefer for (m.panes[0..initialized]) |*p| p.deinit();
+        for (labels, 0..) |label, i| {
+            try m.panes[i].init(m, io, label, i);
+            initialized += 1;
+        }
         m.resetHostModes();
     }
 
-    /// Take the host's replies to `host_queries`; see `useHostRepliesFor`.
+    fn layout(m: *Mux, index: usize) struct { ws: posix.winsize, row: u16, col: u16 } {
+        if (m.count == 1) return .{ .ws = m.ws, .row = 0, .col = 0 };
+        // Ghostty and the pty require at least one cell in each dimension.
+        const width = @max(m.ws.col, 3);
+        const rows = @max(m.ws.row, 2) - 1;
+        const left = (width - 1) / 2;
+        const cols = if (index == 0) left else width - left - 1;
+        return .{
+            .ws = .{
+                .col = cols,
+                .row = rows,
+                .xpixel = @intCast(@as(u32, m.ws.xpixel) * cols / @max(m.ws.col, 1)),
+                .ypixel = @intCast(@as(u32, m.ws.ypixel) * rows / @max(m.ws.row, 1)),
+            },
+            .row = 1,
+            .col = if (index == 0) 0 else left + 1,
+        };
+    }
+
     pub fn useHostReplies(m: *Mux, replies: []const u8) !void {
-        try useHostRepliesFor(&m.terminal, m.gpa, replies);
+        for (m.panes[0..m.count]) |*p| try useHostRepliesFor(&p.terminal, m.gpa, replies);
         m.resetHostModes();
     }
 
     fn resetHostModes(m: *Mux) void {
         inline for (mirrored_modes, &m.host_modes) |value, *host| {
-            host.* = m.terminal.modes.getDefault(comptime vt.modes.modeFromInt(value, false).?);
+            host.* = m.panes[0].terminal.modes.getDefault(comptime vt.modes.modeFromInt(value, false).?);
         }
     }
 
     pub fn deinit(m: *Mux) void {
-        m.stream.deinit();
-        m.render_state.deinit(m.gpa);
-        m.terminal.deinit(m.gpa);
+        for (m.panes[0..m.count]) |*p| p.deinit();
         m.out.deinit();
-    }
-
-    /// Feed output from the program.
-    pub fn feed(m: *Mux, data: []const u8) void {
-        // A zero-width character that starts this output attaches to a
-        // cell on the cursor row without marking the row dirty.
-        m.terminal.screens.active.cursorMarkDirty();
-        m.stream.nextSlice(data);
     }
 
     pub fn resize(m: *Mux, ws: posix.winsize) !void {
         m.ws = ws;
-        try m.stream.handler.resize(.{
-            .cols = ws.col,
-            .rows = ws.row,
-            .cell_size_px = .{
-                .width = if (ws.col > 0) ws.xpixel / ws.col else 0,
-                .height = if (ws.row > 0) ws.ypixel / ws.row else 0,
-            },
-        });
+        for (m.panes[0..m.count], 0..) |*p, i| {
+            const l = m.layout(i);
+            p.ws = l.ws;
+            p.row = l.row;
+            p.col = l.col;
+            try p.stream.handler.resize(.{
+                .cols = p.ws.col,
+                .rows = p.ws.row,
+                .cell_size_px = .{
+                    .width = if (p.ws.col > 0) p.ws.xpixel / p.ws.col else 0,
+                    .height = if (p.ws.row > 0) p.ws.ypixel / p.ws.row else 0,
+                },
+            });
+            p.redraw = true;
+            p.dirty = true;
+        }
         try m.out.writer.writeAll("\x1b[2J");
-        m.redraw = true;
+        m.chrome_dirty = m.count == 2;
     }
 
-    fn fromHandler(handler: *Handler) *Mux {
-        const stream: *vt.TerminalStream = @fieldParentPtr("handler", handler);
-        return @fieldParentPtr("stream", stream);
+    pub fn needsRender(m: *Mux) bool {
+        if (m.chrome_dirty) return true;
+        for (m.panes[0..m.count]) |*p| if (p.dirty and !p.held) return true;
+        return false;
+    }
+
+    pub fn setFocus(m: *Mux, index: usize) void {
+        if (index == m.focus or m.panes[index].status != null) return;
+        const old = &m.panes[m.focus];
+        const next = &m.panes[index];
+        const focus_mode = comptime vt.modes.modeFromInt(1004, false).?;
+        if (old.terminal.modes.get(focus_mode)) old.send("\x1b[O");
+        m.focus = index;
+        if (next.terminal.modes.get(focus_mode)) next.send("\x1b[I");
+        m.chrome_dirty = true;
+        m.writeTitle();
+    }
+
+    fn writeTitle(m: *Mux) void {
+        const title = m.panes[m.focus].terminal.getTitle() orelse "";
+        m.out.writer.print("\x1b]0;{s}\x07", .{title}) catch {};
+    }
+
+    /// Input is parsed only within this read; partial escape sequences are
+    /// forwarded without waiting for another read.
+    pub fn input(m: *Mux, data: []const u8) void {
+        if (m.count == 1) return m.panes[0].send(data);
+        var i: usize = 0;
+        var start: usize = 0;
+        while (i < data.len) {
+            var end = i + 1;
+            var swallow = false;
+            var toggle = false;
+            if (data[i] == 0x1d) {
+                swallow = true;
+                toggle = true;
+            } else if (std.mem.startsWith(u8, data[i..], "\x1b[")) {
+                var final = i + 2;
+                while (final < data.len and !(data[final] >= 0x40 and data[final] <= 0x7e)) : (final += 1) {}
+                if (final < data.len) {
+                    end = final + 1;
+                    const params = data[i + 2 .. final];
+                    if (data[final] == 'u') {
+                        if (focusKey(params)) |press| {
+                            swallow = true;
+                            toggle = press;
+                        }
+                    } else if ((std.mem.startsWith(u8, params, "<") and (data[final] == 'M' or data[final] == 'm')) or
+                        (data[final] == 'M' and (params.len == 0 or std.mem.count(u8, params, ";") == 2)))
+                    {
+                        // All mouse protocols end in M/m. Only SGR cell
+                        // coordinates can be translated into a pane.
+                        m.panes[m.focus].send(data[start..i]);
+                        start = end;
+                        if (std.mem.startsWith(u8, params, "<")) m.mouse(params[1..], data[final]);
+                        if (params.len == 0 and data[final] == 'M') {
+                            // X10/1005 encodes three characters after CSI M.
+                            for (0..3) |_| {
+                                if (end == data.len) break;
+                                const len = if (m.panes[m.focus].terminal.modes.get(.mouse_format_utf8))
+                                    std.unicode.utf8ByteSequenceLength(data[end]) catch 1
+                                else
+                                    1;
+                                end = @min(data.len, end + len);
+                            }
+                            start = end;
+                        }
+                        i = end;
+                        continue;
+                    }
+                }
+            }
+            if (swallow) {
+                m.panes[m.focus].send(data[start..i]);
+                if (toggle) m.setFocus(1 - m.focus);
+                start = end;
+            }
+            i = end;
+        }
+        m.panes[m.focus].send(data[start..]);
+    }
+
+    fn mouse(m: *Mux, params: []const u8, final: u8) void {
+        var fields = std.mem.splitScalar(u8, params, ';');
+        const button = std.fmt.parseInt(u16, fields.next() orelse return, 10) catch return;
+        const x = std.fmt.parseInt(u16, fields.next() orelse return, 10) catch return;
+        const y = std.fmt.parseInt(u16, fields.next() orelse return, 10) catch return;
+        if (fields.next() != null) return;
+        const p = &m.panes[m.focus];
+        if (p.terminal.modes.get(.mouse_format_sgr_pixels)) return;
+        if (x <= p.col or x > p.col + p.ws.col or y <= p.row or y > p.row + p.ws.row) return;
+        var buf: [64]u8 = undefined;
+        p.send(std.fmt.bufPrint(&buf, "\x1b[<{d};{d};{d}{c}", .{ button, x - p.col, y - p.row, final }) catch return);
     }
 };
+
+/// Kitty's key;modifiers:event;... form, including alternate key fields.
+fn focusKey(params: []const u8) ?bool {
+    var fields = std.mem.splitScalar(u8, params, ';');
+    var keys = std.mem.splitScalar(u8, fields.next() orelse return null, ':');
+    if ((std.fmt.parseInt(u32, keys.first(), 10) catch return null) != 93) return null;
+    var modifiers = std.mem.splitScalar(u8, fields.next() orelse return null, ':');
+    if ((std.fmt.parseInt(u16, modifiers.first(), 10) catch return null) != 5) return null;
+    const event = if (modifiers.next()) |e| std.fmt.parseInt(u8, e, 10) catch return null else 1;
+    return switch (event) {
+        1 => true,
+        2, 3 => false,
+        else => null,
+    };
+}
 
 pub fn nowMs() i64 {
     var ts: c.timespec = undefined;
@@ -150,16 +313,16 @@ pub fn writeAll(fd: posix.fd_t, data: []const u8) void {
 // Terminal effects
 
 fn writePty(handler: *Handler, data: []const u8) void {
-    if (Mux.fromHandler(handler).pty) |pty| writeAll(pty, data);
+    Pane.fromHandler(handler).send(data);
 }
 
 fn bell(handler: *Handler) void {
-    Mux.fromHandler(handler).out.writer.writeByte(0x07) catch {};
+    Pane.fromHandler(handler).host.out.writer.writeByte(0x07) catch {};
 }
 
 fn titleChanged(handler: *Handler) void {
-    const title = handler.terminal.getTitle() orelse "";
-    Mux.fromHandler(handler).out.writer.print("\x1b]0;{s}\x07", .{title}) catch {};
+    const p = Pane.fromHandler(handler);
+    if (p == &p.host.panes[p.host.focus]) p.host.writeTitle();
 }
 
 /// Reports a VT220 with ANSI color.
@@ -168,7 +331,7 @@ fn deviceAttributes(_: *Handler) vt.device_attributes.Attributes {
 }
 
 fn size(handler: *Handler) ?vt.size_report.Size {
-    const ws = Mux.fromHandler(handler).ws;
+    const ws = Pane.fromHandler(handler).ws;
     return .{
         .rows = ws.row,
         .columns = ws.col,
@@ -178,9 +341,9 @@ fn size(handler: *Handler) ?vt.size_report.Size {
 }
 
 fn renderHold(handler: *Handler, held: bool) void {
-    const m = Mux.fromHandler(handler);
-    m.held = held;
-    if (held) m.held_since = nowMs();
+    const p = Pane.fromHandler(handler);
+    p.held = held;
+    if (held) p.held_since = nowMs();
 }
 
 //------------------------------------------------------------------------
@@ -237,8 +400,8 @@ fn writeCodepoint(w: *std.Io.Writer, cp: u21) !void {
     try w.writeAll(buf[0..len]);
 }
 
-fn renderRow(w: *std.Io.Writer, cells: std.MultiArrayList(vt.RenderState.Cell).Slice, y: usize) !void {
-    try w.print("\x1b[{d};1H", .{y + 1});
+fn renderRow(w: *std.Io.Writer, cells: std.MultiArrayList(vt.RenderState.Cell).Slice, y: usize, row: u16, col: u16) !void {
+    try w.print("\x1b[{d};{d}H", .{ y + row + 1, col + 1 });
 
     var prev: ?vt.Style = null;
     for (cells.items(.raw), cells.items(.grapheme), cells.items(.style), 0..) |raw, grapheme, style, x| {
@@ -259,7 +422,7 @@ fn renderRow(w: *std.Io.Writer, cells: std.MultiArrayList(vt.RenderState.Cell).S
 
         // Re-sync the column after a wide character in case the host
         // terminal disagrees about its width.
-        if (raw.wide == .wide) try w.print("\x1b[{d}G", .{x + 3});
+        if (raw.wide == .wide) try w.print("\x1b[{d}G", .{x + col + 3});
     }
     try w.writeAll("\x1b[0m");
 }
@@ -268,14 +431,14 @@ fn syncModes(m: *Mux) !void {
     const w = &m.out.writer;
     inline for (mirrored_modes, &m.host_modes) |value, *host| {
         const mode = comptime vt.modes.modeFromInt(value, false).?;
-        const set = m.terminal.modes.get(mode);
+        const set = m.panes[m.focus].terminal.modes.get(mode);
         if (set != host.*) {
             try w.print("\x1b[?{d}{c}", .{ value, @as(u8, if (set) 'h' else 'l') });
             host.* = set;
         }
     }
 
-    const flags: u8 = m.terminal.screens.active.kitty_keyboard.current().int();
+    const flags: u8 = m.panes[m.focus].terminal.screens.active.kitty_keyboard.current().int();
     if (flags != m.host_kitty_flags) {
         try w.print("\x1b[={d};1u", .{flags});
         m.host_kitty_flags = flags;
@@ -285,47 +448,66 @@ fn syncModes(m: *Mux) !void {
 /// Draw the rows that changed since the last frame, the cursor, and the
 /// input modes into `m.out`.
 pub fn render(m: *Mux) !void {
-    const state = &m.render_state;
-    try state.update(m.gpa, &m.terminal);
-    if (m.redraw) state.dirty = .full;
-    m.redraw = false;
     const w = &m.out.writer;
-
-    // Synchronized output keeps the host from showing a half-drawn frame.
     try w.writeAll("\x1b[?2026h\x1b[?25l");
-
-    // Modes first, since grapheme clustering changes how the host lays
-    // out the rows.
+    // Grapheme clustering must be synchronized before drawing rows.
     try syncModes(m);
 
-    if (state.dirty != .false) {
-        const rows = state.row_data.slice();
-        for (rows.items(.cells), rows.items(.dirty), 0..) |cells, dirty, y| {
-            if (state.dirty == .full or dirty) try renderRow(w, cells.slice(), y);
+    if (m.count == 2 and m.chrome_dirty) try renderChrome(m);
+    m.chrome_dirty = false;
+    for (m.panes[0..m.count]) |*p| {
+        if (p.held) continue;
+        const state = &p.render_state;
+        try state.update(m.gpa, &p.terminal);
+        if (p.redraw) state.dirty = .full;
+        p.redraw = false;
+        p.dirty = false;
+        if (state.dirty != .false) {
+            const rows = state.row_data.slice();
+            for (rows.items(.cells), rows.items(.dirty), 0..) |cells, dirty, y| {
+                if (state.dirty == .full or dirty) try renderRow(w, cells.slice(), y, p.row, p.col);
+            }
         }
+        state.clean();
     }
 
-    const cursor = state.cursor;
-    if (cursor.viewport) |pos| try w.print("\x1b[{d};{d}H", .{ pos.y + 1, pos.x + 1 });
+    const p = &m.panes[m.focus];
+    const cursor = p.render_state.cursor;
+    if (cursor.viewport) |pos| try w.print("\x1b[{d};{d}H", .{ pos.y + p.row + 1, pos.x + p.col + 1 });
     var shape: u8 = switch (cursor.visual_style) {
         .bar => 6,
         .underline => 4,
-        else => 2, // steady block
+        else => 2,
     };
     if (cursor.blinking) shape -= 1;
     try w.print("\x1b[{d} q", .{shape});
     if (cursor.visible and cursor.viewport != null) try w.writeAll("\x1b[?25h");
-
     try w.writeAll("\x1b[?2026l");
+}
 
-    state.clean();
+fn renderChrome(m: *Mux) !void {
+    const w = &m.out.writer;
+    for (m.panes[0..m.count], 0..) |*p, index| {
+        try w.print("\x1b[1;{d}H\x1b[0;{d}m", .{ p.col + 1, @as(u8, if (index == m.focus) 7 else 2) });
+        var label: std.Io.Writer.Allocating = .init(m.gpa);
+        defer label.deinit();
+        try label.writer.writeAll(p.label);
+        if (p.status) |status| try label.writer.print(" (exited {d})", .{status});
+        // Keep labels within their pane and prevent command-name controls
+        // from being interpreted by the host.
+        const text = label.written();
+        for (0..p.ws.col) |x| try w.writeByte(if (x < text.len and text[x] >= 0x20 and text[x] <= 0x7e) text[x] else ' ');
+    }
+    try w.writeAll("\x1b[0;2m");
+    for (0..m.ws.row) |y| try w.print("\x1b[{d};{d}H│", .{ y + 1, m.panes[0].ws.col + 1 });
+    try w.writeAll("\x1b[0m");
 }
 
 /// Write what turns the host terminal back to how granite found it.
 pub fn writeRestore(m: *Mux) void {
     const w = &m.out.writer;
     inline for (mirrored_modes, m.host_modes) |value, set| {
-        const default = m.terminal.modes.getDefault(comptime vt.modes.modeFromInt(value, false).?);
+        const default = m.panes[0].terminal.modes.getDefault(comptime vt.modes.modeFromInt(value, false).?);
         if (set != default) w.print("\x1b[?{d}{c}", .{ value, @as(u8, if (default) 'h' else 'l') }) catch {};
     }
     if (m.host_kitty_flags != 0) w.writeAll("\x1b[=0;1u") catch {};
