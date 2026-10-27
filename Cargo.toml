@@ -4,6 +4,11 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.90"
 
+# Round-trip tests render many frames through Ghostty; keep Rust-side cell
+# snapshots and comparisons optimized, with debug assertions and overflow checks.
+[profile.test]
+opt-level = 2
+
 [dependencies]
 libc = "0.2.191"
 # Built from vendor/ghostty, which is checked out at the commit this revision pins.
