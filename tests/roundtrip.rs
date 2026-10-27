@@ -476,7 +476,6 @@ fn recordings() {
 // Additional regression identified during port review: a same-size resize
 // redraws the stale render-state cache instead of the live grapheme cell.
 #[test]
-#[ignore = "Rust mux loses a non-clustering combining mark on same-size resize"]
 fn combining_mark_survives_same_size_resize() {
     let initial = Size { cols: 20, rows: 8 };
     let records = [
