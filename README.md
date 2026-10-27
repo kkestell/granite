@@ -47,7 +47,10 @@ make
 ```
 
 `make` runs `zig build` with the bundled toolchain and installs the binary
-at `zig-out/bin/granite`.
+at `zig-out/bin/granite`. If the toolchain isn't in `.toolchain` yet, `make`
+downloads it from ziglang.org and checks its SHA-256 first; `make toolchain`
+does only that step. If `vendor/ghostty` isn't checked out, `make` runs
+`git submodule update --init` for it.
 
 ## Testing
 
