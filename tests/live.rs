@@ -3,6 +3,7 @@
 use std::cell::Cell;
 use std::ffi::CString;
 use std::rc::Rc;
+use std::sync::Mutex;
 
 use granite::mux::{self, now_ms, write_all};
 use libghostty_vt::render::{CellIterator, CursorVisualStyle, RowIterator};
@@ -15,6 +16,10 @@ use libghostty_vt::{RenderState, Terminal};
 
 const GRANITE: &str = env!("CARGO_BIN_EXE_granite");
 const CHILD: &str = env!("CARGO_BIN_EXE_granite-test-child");
+
+/// Tests run on parallel threads, and forkpty isn't thread-safe on macOS:
+/// it names the pty with ptsname, which returns a shared static buffer.
+static FORKPTY: Mutex<()> = Mutex::new(());
 fn contains(haystack: &[u8], needle: &[u8]) -> bool {
     haystack.windows(needle.len()).any(|w| w == needle)
 }
@@ -112,6 +117,7 @@ impl Host {
         }
         let mut pty = -1;
         let mut ws = winsize(cols, rows);
+        let guard = FORKPTY.lock().unwrap_or_else(|e| e.into_inner());
         let pid = unsafe {
             libc::forkpty(
                 &mut pty,
@@ -120,7 +126,9 @@ impl Host {
                 &mut ws,
             )
         };
-        assert!(pid >= 0, "forkpty: {}", std::io::Error::last_os_error());
+        let err = std::io::Error::last_os_error();
+        drop(guard);
+        assert!(pid >= 0, "forkpty: {err}");
         if pid == 0 {
             unsafe {
                 libc::execv(pointers[0], pointers.as_ptr());
