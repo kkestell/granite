@@ -46,6 +46,9 @@ pub const MIRRORED_MODES: [(u16, bool); 19] = [
     (2027, false), // grapheme clustering
 ];
 
+/// How long a pane may hold drawing (mode 2026) without completing a frame.
+pub const HOLD_TIMEOUT_MS: i64 = 1000;
+
 /// Reports a VT220 with ANSI color.
 const DEVICE_ATTRIBUTES: DeviceAttributes = DeviceAttributes {
     primary: PrimaryDeviceAttributes::new(
@@ -86,6 +89,106 @@ impl PaneState {
     }
 }
 
+/// What a pane last captured from its terminal and hasn't drawn yet. A
+/// capture happens before each frame, and when the program starts a hold
+/// (mode 2026), so that a held pane draws the last frame the program
+/// completed rather than nothing or a half-drawn one.
+struct Frame {
+    render_state: RenderState<'static>,
+    rows: RowIterator<'static>,
+    cells: CellIterator<'static>,
+    /// The rows that changed since the last draw, by viewport row.
+    pending: Vec<Option<RowBuf>>,
+    /// Whether `pending` holds a capture that hasn't been drawn.
+    captured: bool,
+    /// The cursor as of the last capture.
+    cursor: Cursor,
+    /// Rows to capture from the terminal itself; see `Pane::feed`.
+    stale_rows: Vec<u16>,
+}
+
+impl Frame {
+    fn new() -> Result<Frame> {
+        Ok(Frame {
+            render_state: RenderState::new()?,
+            rows: RowIterator::new()?,
+            cells: CellIterator::new()?,
+            pending: Vec::new(),
+            captured: false,
+            cursor: Cursor {
+                viewport: None,
+                visible: true,
+                blinking: false,
+                password_input: false,
+                visual_style: CursorVisualStyle::Block,
+            },
+            stale_rows: Vec::new(),
+        })
+    }
+
+    /// Take the rows that changed since the last capture.
+    fn capture(&mut self, terminal: &Terminal<'static, '_>) -> Result<()> {
+        let snapshot = self.render_state.update(terminal)?;
+        self.cursor = snapshot.cursor()?;
+        let dirty = snapshot.dirty()?;
+        let height = usize::from(snapshot.rows()?);
+        if self.pending.len() != height {
+            self.pending = (0..height).map(|_| None).collect();
+        }
+        let stale = std::mem::take(&mut self.stale_rows);
+        if dirty != Dirty::Clean || !stale.is_empty() {
+            let mut rows = self.rows.update(&snapshot)?;
+            let mut y: u16 = 0;
+            while let Some(r) = rows.next() {
+                let Some(slot) = self.pending.get_mut(usize::from(y)) else { break };
+                if stale.contains(&y) {
+                    let mut row = RowBuf::default();
+                    for x in 0..snapshot.cols()? {
+                        let grid = terminal.grid_ref(Point::Active(PointCoordinate {
+                            x,
+                            y: u32::from(y),
+                        }))?;
+                        let raw = grid.cell()?;
+                        let style = grid.style()?;
+                        row.push(raw, style, |buf| grid.graphemes(buf))?;
+                    }
+                    *slot = Some(row);
+                } else if dirty == Dirty::Full || r.dirty()? {
+                    let mut row = RowBuf::default();
+                    let mut cells = self.cells.update(r)?;
+                    while let Some(c) = cells.next() {
+                        let raw = c.raw_cell()?;
+                        let style = c.style()?;
+                        row.push(raw, style, |buf| {
+                            let len = c.graphemes_len()? as usize;
+                            if buf.len() < len {
+                                return Err(Error::OutOfSpace { required: len });
+                            }
+                            c.graphemes_buf(&mut buf[..len])?;
+                            Ok(len)
+                        })?;
+                    }
+                    *slot = Some(row);
+                }
+                y += 1;
+            }
+        }
+        snapshot.clean()?;
+        self.captured = true;
+        Ok(())
+    }
+
+    /// Draw the captured rows into `out`.
+    fn draw(&mut self, out: &mut Vec<u8>, row: u16, col: u16) {
+        for (y, slot) in self.pending.iter_mut().enumerate() {
+            if let Some(r) = slot.take() {
+                r.write(out, y as u16, row, col);
+            }
+        }
+        self.captured = false;
+    }
+}
+
 /// Per-program state.
 pub struct Pane {
     state: Rc<PaneState>,
@@ -95,14 +198,7 @@ pub struct Pane {
     pub row: u16,
     pub col: u16,
     pub terminal: Terminal<'static, 'static>,
-    render_state: RenderState<'static>,
-    rows: RowIterator<'static>,
-    cells: CellIterator<'static>,
-    /// The cursor as of the last render state update.
-    cursor: Cursor,
-    /// Rows to redraw from the terminal itself; see `feed`.
-    stale_rows: Vec<u16>,
-    redraw: bool,
+    frame: Rc<RefCell<Frame>>,
     dirty: bool,
 }
 
@@ -114,6 +210,7 @@ impl Pane {
             held: Cell::new(false),
             held_since: Cell::new(0),
         });
+        let frame = Rc::new(RefCell::new(Frame::new()?));
         let mut terminal = Terminal::new(layout.ws.ws_col, layout.ws.ws_row)?;
 
         let s = state.clone();
@@ -138,9 +235,15 @@ impl Pane {
             })
         })?;
         let s = state.clone();
-        terminal.on_render_hold(move |_, held| {
+        let f = frame.clone();
+        terminal.on_render_hold(move |t, held| {
             s.held.set(held);
             if held {
+                // Nothing after the hold's start has been processed, so the
+                // terminal holds the frame the program completed.
+                if let Ok(mut frame) = f.try_borrow_mut() {
+                    let _ = frame.capture(t);
+                }
                 s.held_since.set(now_ms());
             }
         })?;
@@ -153,18 +256,7 @@ impl Pane {
             row: layout.row,
             col: layout.col,
             terminal,
-            render_state: RenderState::new()?,
-            rows: RowIterator::new()?,
-            cells: CellIterator::new()?,
-            cursor: Cursor {
-                viewport: None,
-                visible: true,
-                blinking: false,
-                password_input: false,
-                visual_style: CursorVisualStyle::Block,
-            },
-            stale_rows: Vec::new(),
-            redraw: true,
+            frame,
             dirty: true,
         })
     }
@@ -172,11 +264,12 @@ impl Pane {
     pub fn feed(&mut self, data: &[u8]) {
         // A leading zero-width character can attach to the previous cell
         // without dirtying its row, so the render state wouldn't see it.
-        // Redraw the cursor's row from the terminal.
-        if let Ok(y) = self.terminal.cursor_y()
-            && !self.stale_rows.contains(&y)
-        {
-            self.stale_rows.push(y);
+        // Capture the cursor's row from the terminal.
+        if let Ok(y) = self.terminal.cursor_y() {
+            let mut frame = self.frame.borrow_mut();
+            if !frame.stale_rows.contains(&y) {
+                frame.stale_rows.push(y);
+            }
         }
         self.terminal.vt_write(data);
         self.dirty = true;
@@ -194,6 +287,8 @@ impl Pane {
         self.state.ws.get()
     }
 
+    /// Whether the program holds drawing (mode 2026). A held pane draws
+    /// only what was captured when the hold began.
     pub fn held(&self) -> bool {
         self.state.held.get()
     }
@@ -202,8 +297,15 @@ impl Pane {
         self.state.held.set(held);
     }
 
+    /// When the program last completed a frame by starting a hold.
     pub fn held_since(&self) -> i64 {
         self.state.held_since.get()
+    }
+
+    /// Stop honoring a hold that has gone on too long.
+    pub fn end_hold(&mut self) -> Result<()> {
+        self.set_held(false);
+        Ok(())
     }
 
     pub fn send(&self, data: &[u8]) {
@@ -214,59 +316,24 @@ impl Pane {
         self.terminal.mode(mode).unwrap_or(false)
     }
 
-    /// Draw the rows that changed since the last update into `out`.
-    fn render(&mut self, out: &mut Vec<u8>, row: &mut RowBuf) -> Result<()> {
-        if self.redraw {
-            // Marking the render state dirty would repaint its cached rows,
-            // which can miss what `feed` drew from the terminal. Setting a
-            // color default marks the terminal's palette dirty instead,
-            // which makes the update rebuild every row.
-            let cursor = self.terminal.default_cursor_color()?;
-            self.terminal.set_default_cursor_color(cursor)?;
+    fn needs_render(&self) -> bool {
+        if self.held() { self.frame.borrow().captured } else { self.dirty }
+    }
+
+    /// Draw the rows that changed since the last frame into `out`: from
+    /// the terminal, or while held, from the capture at the hold's start.
+    fn render(&mut self, out: &mut Vec<u8>) -> Result<()> {
+        let mut frame = self.frame.borrow_mut();
+        if !self.held() {
+            frame.capture(&self.terminal)?;
+            self.dirty = false;
         }
-        let snapshot = self.render_state.update(&self.terminal)?;
-        self.redraw = false;
-        self.dirty = false;
-        self.cursor = snapshot.cursor()?;
-        let dirty = snapshot.dirty()?;
-        let stale = std::mem::take(&mut self.stale_rows);
-        if dirty != Dirty::Clean || !stale.is_empty() {
-            let mut rows = self.rows.update(&snapshot)?;
-            let mut y: u16 = 0;
-            while let Some(r) = rows.next() {
-                if stale.contains(&y) {
-                    row.clear();
-                    for x in 0..snapshot.cols()? {
-                        let grid = self.terminal.grid_ref(Point::Active(PointCoordinate {
-                            x,
-                            y: u32::from(y),
-                        }))?;
-                        let raw = grid.cell()?;
-                        let style = grid.style()?;
-                        row.push(raw, style, |buf| grid.graphemes(buf))?;
-                    }
-                    row.write(out, y, self.row, self.col);
-                } else if dirty == Dirty::Full || r.dirty()? {
-                    row.clear();
-                    let mut cells = self.cells.update(r)?;
-                    while let Some(c) = cells.next() {
-                        let raw = c.raw_cell()?;
-                        let style = c.style()?;
-                        row.push(raw, style, |buf| {
-                            let len = c.graphemes_len()? as usize;
-                            if buf.len() < len {
-                                return Err(Error::OutOfSpace { required: len });
-                            }
-                            c.graphemes_buf(&mut buf[..len])?;
-                            Ok(len)
-                        })?;
-                    }
-                    row.write(out, y, self.row, self.col);
-                }
-                y += 1;
-            }
-        }
-        snapshot.clean()
+        frame.draw(out, self.row, self.col);
+        Ok(())
+    }
+
+    fn cursor(&self) -> Cursor {
+        self.frame.borrow().cursor
     }
 }
 
@@ -286,7 +353,6 @@ pub struct Mux {
     host_kitty_flags: u8,
     /// Whether terminals cluster graphemes by default, from the host.
     grapheme_default: bool,
-    row: RowBuf,
 }
 
 impl Mux {
@@ -305,7 +371,6 @@ impl Mux {
             host_modes: [false; MIRRORED_MODES.len()],
             host_kitty_flags: 0,
             grapheme_default: false,
-            row: RowBuf::default(),
         };
         m.reset_host_modes();
         Ok(m)
@@ -358,7 +423,12 @@ impl Mux {
                 u32::from(ws.ws_xpixel.checked_div(ws.ws_col).unwrap_or(0)),
                 u32::from(ws.ws_ypixel.checked_div(ws.ws_row).unwrap_or(0)),
             )?;
-            p.redraw = true;
+            // Marking the render state dirty would repaint its cached rows,
+            // which can miss what `feed` captured from the terminal. Setting
+            // a color default marks the terminal's palette dirty instead,
+            // which makes the next capture rebuild every row.
+            let cursor = p.terminal.default_cursor_color()?;
+            p.terminal.set_default_cursor_color(cursor)?;
             p.dirty = true;
         }
         self.shared.out.borrow_mut().extend_from_slice(b"\x1b[2J");
@@ -366,8 +436,18 @@ impl Mux {
         Ok(())
     }
 
+    /// End holds that have gone `HOLD_TIMEOUT_MS` without a completed frame.
+    pub fn expire_holds(&mut self, now: i64) -> Result<()> {
+        for p in &mut self.panes {
+            if p.held() && now - p.held_since() >= HOLD_TIMEOUT_MS {
+                p.end_hold()?;
+            }
+        }
+        Ok(())
+    }
+
     pub fn needs_render(&self) -> bool {
-        self.chrome_dirty || self.panes.iter().any(|p| p.dirty && !p.held())
+        self.chrome_dirty || self.panes.iter().any(Pane::needs_render)
     }
 
     pub fn set_focus(&mut self, index: usize) {
@@ -523,14 +603,11 @@ impl Mux {
         }
         self.chrome_dirty = false;
         for p in &mut self.panes {
-            if p.held() {
-                continue;
-            }
-            p.render(&mut out, &mut self.row)?;
+            p.render(&mut out)?;
         }
 
         let p = &self.panes[self.focus()];
-        let cursor = p.cursor;
+        let cursor = p.cursor();
         if let Some(pos) = cursor.viewport {
             let _ = write!(out, "\x1b[{};{}H", pos.y + p.row + 1, pos.x + p.col + 1);
         }
@@ -712,11 +789,6 @@ struct RowBuf {
 }
 
 impl RowBuf {
-    fn clear(&mut self) {
-        self.cells.clear();
-        self.text.clear();
-    }
-
     /// Add a cell whose text `graphemes` writes into a buffer, returning
     /// its length.
     fn push(

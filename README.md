@@ -38,8 +38,12 @@ the rows that changed.
   graphemes (mode 2027) and starts the terminal in the same mode, so both
   agree on character widths.
 - Frames are wrapped in synchronized output and limited to about 60 per
-  second. While a program holds rendering (mode 2026), its pane waits for
-  up to one second; the other panes continue drawing.
+  second. While a program holds rendering (mode 2026), its pane shows the
+  last frame the program completed before the hold began; the other panes
+  continue drawing. After a second without a completed frame, the pane
+  draws what it has and the hold ends as if the program had ended it. (The
+  Zig version waits up to a second from the latest hold, and draws nothing
+  while it waits.)
 - The focused pane controls the host title. Bells from any pane pass through.
 - Resizing the host window resizes every pty and terminal.
 - An exited pane keeps its last screen, and focus moves to the surviving

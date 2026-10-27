@@ -21,11 +21,10 @@ use std::path::Path;
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use granite::mux::{self, Mux, Winsize, now_ms, read, write_all};
+use granite::mux::{self, HOLD_TIMEOUT_MS, Mux, Winsize, now_ms, read, write_all};
 use libghostty_vt::log::{Level, Logger};
 
 const FRAME_MS: i64 = 16;
-const HOLD_TIMEOUT_MS: i64 = 1000;
 const HOST_REPLY_TIMEOUT_MS: i64 = 1000;
 
 static WINCH_PENDING: AtomicBool = AtomicBool::new(false);
@@ -274,11 +273,7 @@ fn event_loop(m: &mut Mux) -> Result<u8, Box<dyn Error>> {
             resize(m)?;
         }
         let now = now_ms();
-        for p in &m.panes {
-            if p.held() && now - p.held_since() >= HOLD_TIMEOUT_MS {
-                p.set_held(false);
-            }
-        }
+        m.expire_holds(now)?;
         if m.needs_render() && now - last_render >= FRAME_MS {
             m.render()?;
             last_render = now;
