@@ -216,10 +216,15 @@ impl Pane {
 
     /// Draw the rows that changed since the last update into `out`.
     fn render(&mut self, out: &mut Vec<u8>, row: &mut RowBuf) -> Result<()> {
-        let snapshot = self.render_state.update(&self.terminal)?;
         if self.redraw {
-            snapshot.set_dirty(Dirty::Full)?;
+            // Marking the render state dirty would repaint its cached rows,
+            // which can miss what `feed` drew from the terminal. Setting a
+            // color default marks the terminal's palette dirty instead,
+            // which makes the update rebuild every row.
+            let cursor = self.terminal.default_cursor_color()?;
+            self.terminal.set_default_cursor_color(cursor)?;
         }
+        let snapshot = self.render_state.update(&self.terminal)?;
         self.redraw = false;
         self.dirty = false;
         self.cursor = snapshot.cursor()?;
@@ -669,6 +674,17 @@ pub fn now_ms() -> i64 {
     let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
     unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
     ts.tv_sec * 1000 + ts.tv_nsec / 1_000_000
+}
+
+/// Read into `buf`, retrying when a signal interrupts the read. Returns
+/// the byte count, 0 at end of input, or -1 on any other error.
+pub fn read(fd: RawFd, buf: &mut [u8]) -> isize {
+    loop {
+        let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
+        if n >= 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
+            return n;
+        }
+    }
 }
 
 pub fn write_all(fd: RawFd, data: &[u8]) {
