@@ -272,6 +272,16 @@ test "short-lived child's output is drawn before granite exits" {
     }
 }
 
+test "Ghostty's logs stay off the host screen" {
+    // Ghostty logs Kitty graphics commands, which programs send to ask
+    // whether the terminal shows images.
+    const h = try Host.start(&.{ "exit", "0", "\x1b_Gi=31,s=1,v=1,a=q,t=d,f=24;AAAA\x1b\\done" }, 40, 10);
+    defer h.deinit();
+    try std.testing.expectEqual(0, try h.wait());
+    try std.testing.expect(std.mem.indexOf(u8, h.output.items, "done") != null);
+    try std.testing.expect(std.mem.indexOf(u8, h.output.items, "kitty graphics") == null);
+}
+
 test "mode 2026 holds drawing until it ends" {
     const h = try Host.start(&.{"hold"}, 40, 10);
     defer h.deinit();

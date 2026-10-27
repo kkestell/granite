@@ -39,6 +39,8 @@ the rows that changed.
 - An exited pane keeps its last screen, and focus moves to the surviving
   program. Granite exits when all programs have exited, returning the first
   nonzero status in pane order, or zero. A single command keeps its exit status.
+- Ghostty's log messages would land on the screen through stderr, so granite
+  drops them, or appends them to the file named by `GRANITE_LOG`.
 
 ## Layout
 

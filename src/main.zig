@@ -49,6 +49,38 @@ fn flush(m: *Mux) void {
 }
 
 //------------------------------------------------------------------------
+// Logging
+
+pub const std_options: std.Options = .{ .logFn = writeLog };
+
+var log_fd: ?posix.fd_t = null;
+var log_opened = false;
+
+/// Ghostty logs through std.log, and stderr is the host terminal, so logs
+/// would land on the screen. They go to the file named by GRANITE_LOG, or
+/// nowhere.
+fn writeLog(
+    comptime level: std.log.Level,
+    comptime scope: @EnumLiteral(),
+    comptime format: []const u8,
+    args: anytype,
+) void {
+    if (!log_opened) {
+        log_opened = true;
+        if (c.getenv("GRANITE_LOG")) |path| {
+            const fd = c.open(path, .{ .ACCMODE = .WRONLY, .CREAT = true, .APPEND = true }, @as(c_uint, 0o644));
+            if (fd >= 0) log_fd = fd;
+        }
+    }
+    const fd = log_fd orelse return;
+    var buf: [4096]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    w.print("{s}({t}): ", .{ level.asText(), scope }) catch {};
+    w.print(format ++ "\n", args) catch {};
+    writeAll(fd, w.buffered());
+}
+
+//------------------------------------------------------------------------
 // Host terminal setup
 
 fn restoreHost(m: *Mux, orig: posix.termios) void {
